@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"t-1"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"i-1","type":"command_execution","command":"echo hi","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"i-1","type":"command_execution","command":"echo hi","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"i-2","type":"file_change","changes":[{"path":"a.txt","kind":"update"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"i-2","type":"file_change","changes":[{"path":"a.txt","kind":"update"}],"status":"completed"}}
+{"type":"error","message":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 12:00 PM."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 12:00 PM."}}

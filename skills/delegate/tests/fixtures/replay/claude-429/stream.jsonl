@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","cwd":"/work/repo","session_id":"s-1","model":"example-model","permissionMode":"plan"}
+{"type":"assistant","message":{"model":"example-model","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"echo hi"}}]}}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tool-1","type":"tool_result","content":"hi"}]}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}
+{"type":"assistant","message":{"model":"example-model","role":"assistant","content":[{"type":"text","text":"You've hit your session limit"}]}}
+{"type":"result","subtype":"success","num_turns":2,"total_cost_usd":0.01,"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached","result":"You've hit your session limit · resets 12:00am (UTC)"}

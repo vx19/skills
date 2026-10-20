@@ -1,0 +1,27 @@
+name: Checks
+
+on:
+  push:
+    paths:
+      - "skills/delegate/**"
+      - ".github/workflows/checks.yml"
+  pull_request:
+    paths:
+      - "skills/delegate/**"
+      - ".github/workflows/checks.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  delegate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline unit tests
+        working-directory: skills/delegate
+        run: python3 tests/run.py
+      - name: Provider contract
+        working-directory: skills/delegate
+        run: bash tests/contract.sh
