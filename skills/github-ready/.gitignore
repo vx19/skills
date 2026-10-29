@@ -1,0 +1,22 @@
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.cursor/
+.scratch/
+*.swp
+*~
+.env
+.env.local
+.env.*
+!.env.example
+# Personal policies, review notes, and scan output stay on this machine.
+/.private/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+*.pyc
+*.pem

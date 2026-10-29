@@ -7,24 +7,21 @@ A collection of self-contained agent skills.
 | Skill | Purpose | Requirements |
 | --- | --- | --- |
 | [delegate](skills/delegate/SKILL.md) | Dispatch a coding task to Grok, Claude Code, Codex, Cursor, or Pi and return its changes for review. | Python 3.10+, Git, POSIX for live runs, and the selected provider CLI. |
+| [github-ready](skills/github-ready/SKILL.md) | Prepare a local repository for GitHub publication or sharing with a bot: privacy, hygiene, docs, checks, readiness report. | An agent that can edit and run local commands, plus Git, Python 3.10+, and Bash. |
 
-## Install delegate
+## Install
 
 With the [skills CLI](https://github.com/vercel-labs/skills):
 
     npx skills add vx19/skills --skill delegate
+    npx skills add vx19/skills --skill github-ready
 
-Keep the complete skills/delegate/ folder when installing manually. It contains
-the instructions, CLI, Python modules, and task templates.
-Installing the skill does not install or authenticate provider CLIs.
-
-To inspect the command without starting a provider:
-
-    skills/delegate/bin/delegate --help
+Keep the complete `skills/<name>/` folder when installing manually. Installing
+a skill does not install provider CLIs or authenticate them.
 
 ## Checks
 
-From skills/delegate/:
+From `skills/delegate/`:
 
     python3 tests/run.py
     bash tests/contract.sh
@@ -32,6 +29,10 @@ From skills/delegate/:
 Both checks use fake runners and disposable repositories. They do not call
 live providers.
 
+From `skills/github-ready/`:
+
+    python3 -m unittest discover -s scripts -p 'test_*.py'
+
 ## License
 
-[MIT](LICENSE). The delegate skill also includes its own license.
+[MIT](LICENSE). Individual skills may also include their own license file.

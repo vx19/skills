@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - "skills/delegate/**"
+      - "skills/github-ready/**"
       - ".github/workflows/checks.yml"
   pull_request:
     paths:
       - "skills/delegate/**"
+      - "skills/github-ready/**"
       - ".github/workflows/checks.yml"
 
 permissions:
@@ -25,3 +27,12 @@ jobs:
       - name: Provider contract
         working-directory: skills/delegate
         run: bash tests/contract.sh
+
+  github-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline unit tests
+        working-directory: skills/github-ready
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
