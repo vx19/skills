@@ -4,7 +4,8 @@
 generic effort flag — the model slug owns that — so --effort is accepted for
 interface parity and not forwarded. `--read-only` adds `--mode plan` (cursor's
 own no-edit mode). It is an app-level guard; core's post-run delta check backs it.
-Only the stream's final `result` line is parsed, for the answer.
+Only the stream's final `result` line is parsed: the answer, or an error when it
+sets `is_error`.
 """
 
 from __future__ import annotations
@@ -45,6 +46,8 @@ class Cursor(Provider):
         except ValueError:
             return None
         if d.get("type") == "result" and isinstance(d.get("result"), str):
-            return Event(kind="end", stop_reason=d.get("subtype") or "end_turn",
-                         text=d["result"])
+            stop = d.get("subtype") or "end_turn"
+            if d.get("is_error"):
+                return Event(kind="error", stop_reason=stop, text=d["result"])
+            return Event(kind="end", stop_reason=stop, text=d["result"])
         return None

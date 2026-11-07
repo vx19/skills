@@ -283,6 +283,7 @@ class CredentialPreflightTests(unittest.TestCase):
         self.auth.chmod(0)
         self.addCleanup(self.auth.chmod, 0o644)
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file modes")
     def test_unreadable_auth_file_names_the_path(self):
         self._lock_auth()
         self.assertEqual(

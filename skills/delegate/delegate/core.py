@@ -27,6 +27,7 @@ from .envelope import (
     STOP_TIMEOUT,
 )
 from .jobs import _fmt_duration, read_job
+from .lib import gitguard
 from .lib.paths import git_dirty, git_head, git_ok
 from .lib.policy import violations
 from .lib.snapshot import diff_from_tree, diff_paths, snapshot_tree
@@ -75,6 +76,9 @@ def preflight(job: Job, provider: Provider) -> None:
         raise Preflight(blocked)
 
 
+_PROGRESS_KINDS = frozenset({"text", "tool_call", "tool_result", "thought", "usage"})
+
+
 class _Accum:
     """Rolling tally built from parsed stream events."""
 
@@ -83,6 +87,7 @@ class _Accum:
         self.cost_usd: float | None = None
         self.failed_tool_calls = 0
         self.stop_reason: str | None = None
+        # The runner's latest error, until later progress shows it recovered.
         self.error: str | None = None
         self.last_texts: list[str] = []
         # The final message: text since the last tool activity (grok streams it
@@ -125,8 +130,12 @@ class _Accum:
             self.cost_usd = ev.cost_usd
         if ev.stop_reason:
             self.stop_reason = ev.stop_reason
-        if ev.kind == "error" and ev.text:
-            self.error = ev.text
+        if ev.kind == "error":
+            self.error = ev.text or "error"
+        elif ev.kind in _PROGRESS_KINDS:
+            # A runner that retries (codex "Reconnecting… 1/5") and then makes
+            # progress has recovered; only an error at the end of the stream counts.
+            self.error = None
         if ev.kind == "tool_result" and ev.ok is False:
             self.failed_tool_calls += 1
             self.counts["failed_tool"] += 1
@@ -149,6 +158,8 @@ class _Accum:
 
 def _record_answer(job: Job, provider: Provider, env: Envelope, acc: _Accum) -> str | None:
     """Point answerPath at the final message; return its text."""
+    if acc.error:
+        return None
     runner_file = provider.answer_file(job)
     if runner_file is not None:
         if runner_file.is_file():
@@ -423,6 +434,7 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
     proc = None
     monitor = None
     tree0 = None
+    meta0 = None
     rc = None
     previous_signals = {}
 
@@ -463,6 +475,7 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
                 previous_signals[sig] = signal.signal(sig, request_cancel)
         env.base_commit, env.dirty_before = git_head(job.cwd), git_dirty(job.cwd)
         provider.prepare(job, env)
+        meta0 = gitguard.fingerprint(job.cwd)
         tree0 = snapshot_tree(job.cwd, job.run_dir / "index0")
         if (job.run_dir / "cancel").exists():
             cancelled.set()
@@ -544,6 +557,11 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
                 env.stop_reason, env.exit_code = STOP_ERROR, 1
                 why = acc.error or _runner_error(log_path)
                 env.error = f"{provider.runner} exited {rc}" + (f": {why}" if why else "")
+            elif acc.error:
+                # The runner exited 0 but its stream ended on an error.
+                env.stop_reason, env.exit_code = STOP_ERROR, 1
+                env.error = (f"{provider.runner} exited 0 but reported an error: "
+                             f"{acc.error}")
             else:
                 env.stop_reason, env.exit_code = STOP_END, 0
         try:
@@ -584,6 +602,14 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
             env.error = (f"work tree changed while the read-only run was active "
                          f"({env.diff_stat}); the worker or another process wrote it; "
                          f"see {env.diff_path}")
+            env.stop_reason, env.exit_code = STOP_ERROR, 2
+        # What git runs and sees is config, not content: a change is reported, never
+        # repaired, and (like HEAD below) outranks the worker's own exit.
+        touched = gitguard.changed(meta0, gitguard.fingerprint(job.cwd) or {}) if meta0 else []
+        if touched:
+            shown = ", ".join(touched[:5]) + (f" (+{len(touched) - 5} more)" if len(touched) > 5 else "")
+            env.error = (f"worker changed git metadata ({shown}); the wrapper never repairs "
+                         f"it. Inspect: git -C {job.cwd} config --show-origin --list")
             env.stop_reason, env.exit_code = STOP_ERROR, 2
         # SAFE-1 has precedence over worker exit, cancellation, and timeout.
         head_after = git_head(job.cwd)

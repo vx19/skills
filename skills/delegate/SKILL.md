@@ -144,6 +144,13 @@ Every run writes one schema-3 JSON object to stdout and `result.json`
 (`delegate/envelope.py`). Read these first:
 
 - `stopReason` — one of `end_turn`, `cancelled`, `timeout`, `error`.
+  A runner that exits 0 but whose stream ends on an error (claude `is_error` or
+  an `error_*` subtype, a grok `error` event, a pi `stopReason: error` message,
+  a cursor `is_error` result) is `error`, exit 1, with no `answerPath`.
+  A run that changes `.git/config`, hooks, `info/attributes`, `info/exclude`, the
+  checked-out branch or a local branch or tag is `error`, exit 2: the wrapper reports it
+  and never repairs it. Its own git calls ignore the repo's fsmonitor, hooks, external
+  diff and filter settings, so a diff shows raw file bytes.
 - `exitCode` — 0 success, 1 worker failure/cancel/timeout, 2 preflight/error.
 - `error` — the runner's own failure message when its stream reports one;
   otherwise the stderr or preflight reason.

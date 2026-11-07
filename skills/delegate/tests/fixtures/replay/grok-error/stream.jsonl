@@ -1,0 +1,3 @@
+{"type":"thought","data":"checking"}
+{"type":"text","data":"working"}
+{"type":"error","message":"model overloaded, giving up"}

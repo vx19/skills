@@ -27,6 +27,41 @@ class ReplayPinTests(unittest.TestCase):
     def envelope(self, name: str) -> dict:
         return replaymod.replay(FIXTURES / name)
 
+    def assert_exit0_error(self, name: str, runner: str, message: str) -> dict:
+        env = self.envelope(name)
+        self.assertEqual((env["stopReason"], env["exitCode"]), ("error", 1))
+        self.assertTrue(
+            env["error"].startswith(f"{runner} exited 0 but reported an error: "),
+            env["error"])
+        self.assertIn(message, env["error"])
+        self.assertIsNone(env.get("answerPath"))
+        return env
+
+    def test_claude_429_with_exit_0_is_an_error(self) -> None:
+        self.assert_exit0_error("claude-429-exit0", "claude", "session limit")
+
+    def test_claude_error_subtype_without_is_error_is_an_error(self) -> None:
+        self.assert_exit0_error("claude-max-turns", "claude", "error_max_turns")
+
+    def test_grok_error_event_with_exit_0_is_an_error(self) -> None:
+        self.assert_exit0_error("grok-error", "grok", "model overloaded")
+
+    def test_pi_error_message_with_exit_0_is_an_error(self) -> None:
+        self.assert_exit0_error("pi-error", "pi", "429 rate limit exceeded")
+
+    def test_cursor_is_error_with_exit_0_is_an_error(self) -> None:
+        self.assert_exit0_error("cursor-is-error", "cursor-agent", "Usage limit reached")
+
+    def test_a_retried_error_followed_by_progress_still_succeeds(self) -> None:
+        env = self.envelope("codex-reconnect-then-success")
+        self.assertEqual((env["stopReason"], env["exitCode"]), ("end_turn", 0))
+        self.assertIsNone(env["error"])
+
+    def test_a_recovered_retry_does_not_mask_the_real_failure(self) -> None:
+        env = self.envelope("codex-reconnect-then-exit1")
+        self.assertEqual((env["stopReason"], env["exitCode"]), ("error", 1))
+        self.assertEqual(env["error"], "codex exited 1: quota exceeded for this account")
+
     def test_codex_usage_limit(self) -> None:
         env = self.envelope("codex-usage-limit")
         self.assertEqual(env["provider"], "codex")

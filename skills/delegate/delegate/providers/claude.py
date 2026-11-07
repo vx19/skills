@@ -57,8 +57,8 @@ class Claude(Provider):
             turns = _int(d.get("num_turns"))
             cost = _float(d.get("total_cost_usd") or d.get("cost_usd"))
             text = d.get("result") if isinstance(d.get("result"), str) else None
-            if d.get("is_error"):
-                why = text or "error"
+            if d.get("is_error") or stop.startswith("error"):
+                why = text or stop
                 status = d.get("api_error_status")
                 if status is not None and status != "":
                     why = f"{why} (HTTP {status})"

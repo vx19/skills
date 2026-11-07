@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .constants import STATE_DIRNAME
+from .gitguard import hardened
 
 
 def state_root() -> Path:
@@ -85,7 +86,7 @@ def git_common_dir(cwd: Path) -> Path | None:
 
 def git_dirty(cwd: Path) -> bool:
     proc = subprocess.run(
-        ["git", "-C", str(cwd), "status", "--porcelain"],
+        ["git", "-C", str(cwd), *hardened(cwd), "status", "--porcelain"],
         capture_output=True,
         text=True,
     )

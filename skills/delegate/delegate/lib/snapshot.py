@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .gitguard import hardened
+
 
 class SnapshotError(RuntimeError):
     """Private-index `git add -A` failed; wrapper must not treat this as success."""
@@ -38,6 +40,8 @@ def diff_from_tree(cwd: Path, tree_id: str, index_file: Path) -> str:
         "diff",
         "--cached",
         "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
         tree_id,
         check=True,
     )
@@ -209,7 +213,7 @@ def _git(
     raises. This never lets a UnicodeDecodeError escape mid-teardown.
     """
     raw = subprocess.run(
-        ["git", "-C", str(cwd), *args],
+        ["git", "-C", str(cwd), *hardened(cwd), *args],
         env=env,
         check=False,
         capture_output=True,

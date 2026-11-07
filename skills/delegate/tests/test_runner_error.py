@@ -117,6 +117,7 @@ class PiPreflightTests(unittest.TestCase):
         self.agent.chmod(0o500)
         self.addCleanup(self.agent.chmod, 0o700)
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file modes")
     def test_unwritable_agent_dir_is_a_preflight_error(self):
         self.lock_agent()
         message = (
@@ -136,6 +137,7 @@ class PiPreflightTests(unittest.TestCase):
         self.assertEqual(self.preflight(self.job()), "")
         self.assertEqual(list(self.agent.iterdir()), [])
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file modes")
     def test_unset_env_probes_home_pi_agent(self):
         home = self.root / "home"
         agent = home / ".pi" / "agent"

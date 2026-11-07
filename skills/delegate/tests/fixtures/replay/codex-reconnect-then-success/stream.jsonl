@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"t-1"}
+{"type":"error","message":"Reconnecting... 1/5"}
+{"type":"item.completed","item":{"id":"i-0","type":"agent_message","text":"All done."}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}

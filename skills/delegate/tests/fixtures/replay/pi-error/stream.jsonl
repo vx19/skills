@@ -1,0 +1,3 @@
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"working"}}
+{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"429 rate limit exceeded","usage":{"input":10,"output":0}}}
+{"type":"turn_end"}

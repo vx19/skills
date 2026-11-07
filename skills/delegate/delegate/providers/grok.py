@@ -259,6 +259,8 @@ def _read_trusted(target: str) -> bool:
 # one-file fix.
 def _parse_acp(d: dict) -> Event | None:
     t = d.get("type") or d.get("sessionUpdate") or d.get("kind")
+    if t == "error":
+        return Event(kind="error", text=_error_text(d))
     # Terminal / result line.
     if t in ("result", "end", "turn_end", "session_end") or "stopReason" in d or "stop_reason" in d:
         return Event(
@@ -314,6 +316,16 @@ def _tool_path(d: dict):
         return Provider._first(inp, "path", "file_path", "filename", "file", "target",
                                "target_file", "target_directory")
     return None
+
+
+def _error_text(d: dict) -> str:
+    for key in ("message", "error"):
+        v = d.get(key)
+        if isinstance(v, dict):
+            v = v.get("message")
+        if isinstance(v, str) and v:
+            return v
+    return "error"
 
 
 def _text_of(d: dict):

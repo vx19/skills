@@ -19,6 +19,14 @@ from delegate.lib.snapshot import SnapshotError
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def wait_gone(pid, timeout=2.0):
+    """True once `pid` is no longer alive; a killed child lingers until reaped."""
+    deadline = time.monotonic() + timeout
+    while jobs.pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return not jobs.pid_alive(pid)
+
+
 class Fake(Provider):
     name = "fake"
     runner = sys.executable
@@ -130,7 +138,7 @@ class LifecycleTests(unittest.TestCase):
         env = core.run(self.job, Fake(leader))
         self.assertEqual(env.exit_code, 0, env.error)
         pid = int((self.repo / "child.pid").read_text())
-        self.assertFalse(jobs.pid_alive(pid), "stray worker child outlived the run")
+        self.assertTrue(wait_gone(pid), "stray worker child outlived the run")
 
     def test_undecodable_diff_is_written_as_exact_bytes(self):
         provider = Fake("open('latin1.txt','wb').write(bytes([0xff, 0xfe, 0x41]))")
@@ -277,7 +285,7 @@ class LifecycleTests(unittest.TestCase):
                     self.assertEqual(env["stopReason"], "cancelled")
                     self.assertIn("hung.txt", Path(env["diffPath"]).read_text())
                     worker_pid = int((self.repo / "worker.pid").read_text())
-                    self.assertFalse(jobs.pid_alive(worker_pid))
+                    self.assertTrue(wait_gone(worker_pid))
                     self.assertEqual(jobs.read_result(rec.run_id)["stopReason"], "cancelled")
                 finally:
                     if proc.poll() is None:

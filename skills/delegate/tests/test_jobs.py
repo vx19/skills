@@ -1,18 +1,29 @@
-import json, os, sys, time, unittest, tempfile
+import json, os, shutil, sys, time, unittest, tempfile
+from unittest.mock import patch
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class TestJobs(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        os.environ["XDG_STATE_HOME"] = self.tmp
-        # import after env set so state_root resolves under tmp
         import importlib
         from delegate.lib import paths as _paths
-        importlib.reload(_paths)
         from delegate import jobs as _jobs
-        importlib.reload(_jobs)
+
+        def reload():
+            importlib.reload(_paths)
+            importlib.reload(_jobs)
+
+        # cleanups run last-in first-out: remove tmp, restore env, then reload
+        self.addCleanup(reload)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.environ["XDG_STATE_HOME"] = self.tmp
+        # reload after env set so state_root resolves under tmp
+        reload()
         self.jobs = _jobs
 
     def test_save_read_roundtrip(self):

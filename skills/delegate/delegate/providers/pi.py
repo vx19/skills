@@ -91,7 +91,7 @@ def _parse_line(data: dict) -> Event | None:
     if kind == "tool_execution_end":
         return _tool_result(data)
     if kind == "message_end":
-        return _assistant_usage(data)
+        return _message_error(data) or _assistant_usage(data)
     # turn_end repeats the assistant message's usage; count the turn only.
     # "turn", not "end": a mid-run status line must not say "last end".
     if kind == "turn_end":
@@ -143,6 +143,14 @@ def _tool_result(data: dict) -> Event:
     if not isinstance(name, str):
         name = None
     return Event(kind="tool_result", name=name, ok=not data.get("isError"))
+
+
+def _message_error(data: dict) -> Event | None:
+    message = data.get("message")
+    if not isinstance(message, dict) or message.get("stopReason") != "error":
+        return None
+    why = message.get("errorMessage")
+    return Event(kind="error", text=why if isinstance(why, str) and why else "error")
 
 
 def _assistant_usage(data: dict) -> Event | None:

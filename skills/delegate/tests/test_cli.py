@@ -235,6 +235,7 @@ class TestDoctor(CliTestBase):
         self.assertEqual(code, 0, f"out={out} err={err}")
         self.assertIn("warn grok", out)
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file modes")
     def test_unreadable_grok_credentials_fail_doctor(self):
         auth = Path(self._tmp.name) / ".grok" / "auth.json"
         auth.parent.mkdir()
