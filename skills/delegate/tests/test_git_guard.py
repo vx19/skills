@@ -3,7 +3,6 @@ git does without the run saying so."""
 
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from delegate import core, jobs
 from delegate.providers.base import Job, Provider
+from tests.helpers import git, init_repo  # noqa: E402
 
 
 class Fake(Provider):
@@ -32,13 +32,8 @@ class GitGuardTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
-        self.git("init", "-q")
-        (self.repo / "base.dat").write_text("base\n")
-        (self.repo / ".gitattributes").write_text("*.dat filter=evil\n")
-        self.git("add", ".")
-        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "initial")
+        self.repo = init_repo(self.root / "repo", {"base.dat": "base\n",
+                                                   ".gitattributes": "*.dat filter=evil\n"})
         self.marker = self.root / "marker"
         env = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
         env.start()
@@ -46,8 +41,7 @@ class GitGuardTests(unittest.TestCase):
         self.job = Job("fake", self.repo, "task", "run", jobs.run_dir_for("run"))
 
     def git(self, *args):
-        return subprocess.run(["git", "-C", str(self.repo), *args], check=True,
-                              capture_output=True, text=True).stdout.strip()
+        return git(self.repo, *args)
 
     def plant(self, key, command):
         """A worker script line that sets one repo config key to run `command`."""

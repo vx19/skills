@@ -6,6 +6,7 @@ A fixture directory holds:
     meta.json     {"provider": "codex", "exit": 1}
     stream.jsonl  the runner's stdout, one JSON event per line
     runner.log    the runner's stderr
+    answer.txt    optional: the final message codex writes to --output-last-message
 
 Fixtures are synthetic. Recorded runs are only a source for event shapes and
 the decisive error lines; recorded project content never lands in this repo.
@@ -47,26 +48,38 @@ def _fixture_parts(fixture: Path) -> tuple[str, int]:
 
 
 def _fake_source(fixture: Path, sleep: float, exit_code: int) -> str:
-    """A runner that ignores its argv and re-emits one fixture, in order."""
+    """A runner that re-emits one fixture's bytes, in order.
+
+    Its argv is ignored except `--output-last-message PATH`, where the
+    fixture's answer.txt goes, as codex writes its final message there.
+    """
     stream = str((fixture / "stream.jsonl").resolve())
     runner_log = str((fixture / "runner.log").resolve())
+    answer = str((fixture / "answer.txt").resolve())
     return f"""#!/usr/bin/env python3
+import shutil
 import sys
 import time
 
 stream = {stream!r}
 runner_log = {runner_log!r}
+answer = {answer!r}
 sleep = {float(sleep)!r}
 
-with open(stream, encoding="utf-8", errors="replace") as fh:
+with open(stream, "rb") as fh:
     for line in fh:
-        sys.stdout.write(line)
+        sys.stdout.buffer.write(line)
         sys.stdout.flush()
         if sleep:
             time.sleep(sleep)
-with open(runner_log, encoding="utf-8", errors="replace") as fh:
-    sys.stderr.write(fh.read())
+with open(runner_log, "rb") as fh:
+    sys.stderr.buffer.write(fh.read())
 sys.stderr.flush()
+if "--output-last-message" in sys.argv:
+    try:
+        shutil.copyfile(answer, sys.argv[sys.argv.index("--output-last-message") + 1])
+    except FileNotFoundError:
+        pass
 sys.exit({exit_code})
 """
 
@@ -94,13 +107,15 @@ def _scratch_repo(root: Path) -> Path:
 
 
 def replay(fixture: str | Path, sleep: float = 0, extra=(),
-           artifacts: dict | None = None) -> dict:
+           artifacts: dict | None = None, env_extra: dict | None = None) -> dict:
     """Run one fixture through the real CLI and return its envelope.
 
     `extra` is a tuple of extra `delegate run` arguments (flags only). The
     fixture's provider chooses the fake runner's name; `exit` is its status.
     When `artifacts` is a dict, the run's `progress.json` and `result.json`
-    are copied into it before the temp state tree is removed.
+    are copied into it before the temp state tree is removed, with every
+    run-dir file's text under "files" and the answer's text under "answer".
+    `env_extra` adds environment variables for the run.
     """
     fixture = Path(fixture).resolve()
     provider, exit_code = _fixture_parts(fixture)
@@ -126,6 +141,7 @@ def replay(fixture: str | Path, sleep: float = 0, extra=(),
         # pi probes ~/.pi/agent; HOME above is the throwaway one.
         env.pop("PI_CODING_AGENT_DIR", None)
         env.pop("GROK_AGENT", None)
+        env.update(env_extra or {})
 
         argv = [str(DELEGATE), "run", "--provider", provider,
                 "--cwd", str(repo), "--quiet", *extra, "--", "replay"]
@@ -148,6 +164,12 @@ def replay(fixture: str | Path, sleep: float = 0, extra=(),
                     artifacts[name] = (run_dir / name).read_text(encoding="utf-8")
                 except OSError:
                     pass
+            artifacts["stateRootMode"] = (state / "delegate").stat().st_mode & 0o777
+            artifacts["files"] = {
+                p.name: p.read_text(encoding="utf-8", errors="replace")
+                for p in run_dir.iterdir() if p.is_file()}
+            if envelope.get("answerPath"):
+                artifacts["answer"] = Path(envelope["answerPath"]).read_text(encoding="utf-8")
         return envelope
 
 

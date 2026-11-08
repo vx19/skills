@@ -3,23 +3,21 @@
 Offline: dry-run argv, the refusal for providers without a desktop-control tool,
 denial detection over a recorded codex stream, and the doctor's plugin check.
 """
-import io
 import json
 import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from delegate import cli  # noqa: E402
 from delegate.envelope import Envelope  # noqa: E402
 from delegate.prompt import COMPUTER_USE_CLAUSE  # noqa: E402
 from delegate.providers.base import Job  # noqa: E402
 from delegate.providers.codex import Codex, computer_use_status, denied_apps  # noqa: E402
+from tests.helpers import run_cli  # noqa: E402
 
 USAGE_EXIT = 64
 
@@ -34,23 +32,19 @@ class _Cli(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def run_cli(self, argv):
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(argv)
-        return code, out.getvalue(), err.getvalue()
+        return run_cli(argv)
 
-    def dry(self, provider, *flags):
+    def dry(self, provider, *flags, key="argv"):
         code, out, err = self.run_cli(["run", "--provider", provider, "--cwd", ".",
                                        "--dry-run", *flags, "read the screen"])
         self.assertEqual(code, 0, err)
-        return json.loads(out)["providerExtra"]["argv"]
+        return json.loads(out)["providerExtra"][key]
 
 
 class FlagTests(_Cli):
     def test_codex_prompt_carries_the_clause(self):
-        argv = self.dry("codex", "--computer-use", "--read-only")
-        self.assertTrue(argv[-1].endswith(COMPUTER_USE_CLAUSE))
-        self.assertIn("read-only", argv)
+        prompt = self.dry("codex", "--computer-use", "--read-only", key="prompt")
+        self.assertTrue(prompt.endswith(COMPUTER_USE_CLAUSE))
 
     def test_clause_absent_without_the_flag(self):
         self.assertNotIn(COMPUTER_USE_CLAUSE, self.dry("codex")[-1])

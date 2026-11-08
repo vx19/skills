@@ -24,7 +24,9 @@ commit ownership, no built-in review.
 ## Run contract
 
 Live runs currently require a POSIX host for process groups and job control.
-Paths such as `bin/delegate` and `templates/` are relative to this skill's folder.
+`bin/delegate` and `templates/` are relative to this skill's folder. The paths
+you pass (`--cwd`, `--rules`, `--task`, `--schema`, `--report`) resolve against
+your own working directory; `--scope` resolves against `--cwd`.
 
 ```bash
 bin/delegate run --provider grok --cwd /path/to/repo -- "one concrete task"
@@ -34,11 +36,21 @@ With standing rules and a per-phase task file (preferred for real work):
 
 ```bash
 bin/delegate run --provider claude --cwd /path/to/repo \
-  --rules templates/rules.md \
+  --rules my-rules.md \
   --task phase-1.task.md \
   --scope src/ --scope tests/ \
   --report /path/to/repo/.reports/phase-1.md
 ```
+
+Copy the templates and fill them in: [`templates/rules.md`](templates/rules.md)
+for standing rules, [`templates/task.md`](templates/task.md) for a change, and
+[`templates/observe.task.md`](templates/observe.task.md) for a `--read-only`
+question. HTML comments in a rules or task file are notes for you; the worker
+never sees them. Prefer small, reviewable tasks.
+
+Every runner starts in a non-prompting posture (`--permission-mode auto`,
+`--approve-for-me`, `--force --trust`, …): a permission prompt nobody can
+answer would read as a cancel.
 
 `run` flags (`bin/delegate run --help` lists them):
 
@@ -47,36 +59,39 @@ bin/delegate run --provider claude --cwd /path/to/repo \
 | `--provider {grok,claude,codex,cursor,pi}` | Required. Which runner. |
 | `--cwd DIR` | Target git work tree (default `.`). Must have a commit. |
 | `--model M` | Pass-through model id. |
-| `--effort E` | Reasoning effort. **Not** forwarded by cursor; adapter support varies. |
+| `--effort E` | Reasoning effort, one lowercase word (else exit 64). Not forwarded by cursor (warns). |
 | `--rules FILE` | Repeatable. Standing constraints, prepended to the prompt. |
-| `--task FILE` | Task body from a file (mutually exclusive with a positional prompt). |
+| `--task FILE` | Task body from a file (mutually exclusive with a positional prompt). claude and codex read the prompt on stdin and grok from a file; cursor and pi take it as one argument, so for them it must stay under 120 KiB (exit 64). |
 | positional / `-- PROMPT` | Inline task text (use `--` so flags in the prompt are not parsed). |
-| `--max-turns N` | Turn cap (grok, claude). A fuse: hitting it fails exit 1 ("max turns reached"), not a partial success. |
-| `--scope PATH` | Repeatable. Expected change paths; violations reported, not blocked. `.` / empty = whole tree. |
-| `--report FILE` | Path added to the prompt; a stub is synthesised on a late cancel/timeout. |
-| `--provider-arg K=V` | Repeatable. grok `sandbox=NAME` / `disallowed-tools=` / `deny=` / `no-memory=true`, pi `provider=`. |
-| `--background` | Detach; prints `{jobId, runDir}`; poll with `status`/`wait`. |
-| `--no-sandbox` | Drop the provider sandbox (grok/codex/cursor). Dangerous. See [Grok sandbox](#grok-sandbox). |
-| `--read-only` | Runner no-write mode (grok, codex: kernel; claude, cursor: plan). Any delta fails exit 2. Deliverable is `answerPath`. Other writers in the same tree also trip it. Refused (64) for pi, `--no-sandbox`, `--report`. |
+| `--max-turns N` | Turn cap (grok, claude; others warn). A fuse: hitting it fails the run (exit 1), not a partial success. |
+| `--scope PATH` | Repeatable. Expected change paths, relative to `--cwd`. Violations are reported, never blocked. `.` / empty = all of `--cwd`. The `--report` file never counts. A live job with an overlapping scope in the same tree warns. |
+| `--report FILE` | Adds one sentence to the prompt: write the report to FILE before the final verification run. A stub is written on a late cancel or timeout. |
+| `--provider-arg K=V` | Repeatable. grok `sandbox=NAME` / `disallowed-tools=` / `deny=` / `no-memory=true`, pi `provider=`. Any other key exits 64. |
+| `--background` | Detach; prints `{jobId, runDir}` and exits 0. A preflight failure prints the error envelope and exits 2 instead. Poll with `status`/`wait`. |
+| `--no-sandbox` | Drop the provider sandbox (grok, codex, cursor; claude and pi have none and warn). Dangerous. |
+| `--read-only` | Run with no writes; the deliverable is `answerPath`. Any delta fails exit 2, including one another writer made in the same tree. Refused (64) for pi and with `--no-sandbox` or `--report`. How each runner enforces it: `readOnlyEnforcement` below. |
 | `--web` | Keep web search/fetch under `--read-only` (off by default on grok/claude; codex/cursor keep their default, with a warning). |
-| `--schema FILE` | Final answer must be one JSON object matching this schema (prompt-appended; core takes the whole answer, else last fence, else `{…}` span, and checks every top-level `required` key). Success → `answer.json`. Mismatch → exit 1. Accepted for pi. |
+| `--schema FILE` | Final answer must be one JSON object matching this schema (any provider; appended to the prompt). Core takes the last top-level JSON object in the answer and checks every top-level `required` key. Success → `answer.json`. Mismatch → exit 1. |
 | `--computer-use` | Let the worker drive desktop apps with Codex's Computer Use tool (codex only; refused with 64 elsewhere). See [Computer use](#computer-use-codex). |
-| `--dry-run` | Print the exact `argv` in the envelope; no launch, offline. |
+| `--dry-run` | Print the exact `argv` and the assembled prompt (`providerExtra.argv`, `providerExtra.prompt`) and exit 0. Argv only: no preflight (a bad `--cwd` still exits 0) and no launch. With grok `--read-only` it runs `grok --version` once to choose the sandbox. |
 | `--quiet` | Suppress the streamed per-event stderr view. |
 
 Job control:
 
 ```bash
 bin/delegate status [JOB] [--limit N]   # list or detail one job
-bin/delegate wait JOB [--timeout S]     # block until it finishes (exit 3 if still live)
+bin/delegate wait JOB [--timeout S]     # block until it finishes
 bin/delegate result JOB                 # print the finished envelope
 bin/delegate logs JOB [--tail N] [--raw]  # compact view; --raw prints the JSONL
 bin/delegate cancel JOB                 # request cancellation; core kills the worker group
+                                        # (wrapper dead: stops the orphaned group, settles the run)
 ```
 
 A run whose wrapper died before writing `result.json` converges to one synthetic
 `error` envelope (`wrapper died before writing a result`) on the next `status`,
-`wait`, or `result`. Run dirs are kept until you opt in to cleanup: with
+`wait`, or `result`, once its worker group is gone. That envelope carries the
+worker's real delta (`diffPath`, `diffStat`, `emptyDiff`, `scopeViolations`)
+against the run's baseline. Run dirs are kept until you opt in to cleanup: with
 `DELEGATE_KEEP_DAYS=N`, `run` deletes finished run dirs older than N days, at
 most once a day.
 
@@ -86,6 +101,23 @@ Setup:
 bin/delegate doctor [--provider P] [--cwd DIR]   # runners, git, trust
 bin/delegate --version
 ```
+
+## Exit codes
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Success (`stopReason: end_turn`); `doctor`: a run could start. |
+| `1` | Worker failure (`error`), `cancelled` or `timeout`. Also an unknown job, or a dead wrapper with no result, for `status`/`wait`/`result`/`cancel`. |
+| `2` | Preflight or wrapper error, with an `error` envelope: runner missing, bad `--cwd`, snapshot or diff failure, a write under `--read-only`, a git-metadata change, a moved HEAD. `doctor`: a run could not start. |
+| `3` | `wait --timeout` ended while the job is still running. |
+| `64` | Usage error (bad flag, oversized prompt, invalid job id). **No envelope**, only a stderr line. |
+| `130` | Interrupted by Ctrl-C outside a run (a running job's SIGINT ends it as `cancelled`, exit 1). |
+
+So `stopReason: error` carries exit 1 when the worker failed and exit 2 when
+the wrapper did. `doctor` exits 2 for a provider named with `--provider` whose
+runner is missing, unreadable grok credentials, or a `--cwd` that is not a git
+work tree with a commit. Without `--provider`, a missing runner is only a
+`warn`. `info` lines never change the exit code.
 
 ## Watching a live run
 
@@ -99,30 +131,38 @@ running 14m12s · last thought 2s ago · last tool 11m00s ago · last write 3m05
 - `last thought` is the kind and age of the last parsed event (`last event` when the kind was not recorded).
 - `last tool` / `last write` stay `never` until one happens.
 - `tokens out` appears once `usage.requests` is at least 1.
-- `heartbeat never` means that file is missing.
+- `heartbeat never` means that file is missing. The `heartbeat` file is deprecated
+  and goes at 1.0; `progress.json`'s `updatedAt` carries the same signal.
 
-`wait JOB --timeout S` returns the envelope's exit code (0 success, 1 worker
-failure, 2 preflight or lifecycle error). **3 means it is still running**.
-Exit 1 is also an unknown job, or a dead wrapper that has just received its synthetic error envelope.
+Judge grok, codex and pi by `usage.requests` and output tokens rising
+(`tokens out`, or `usage` in `progress.json`). Claude and cursor report no
+tokens: judge them by the age of the last event and the heartbeat. A healthy
+Grok worker often makes no write for 5–8 minutes, including 2+ minutes with no
+tool call, then writes in a burst. Do not cancel early unless that signal has
+stopped moving for several minutes.
 
-Judge the run by `usage.requests` and output tokens rising (`tokens out` on
-the status line, or `usage` in `progress.json`). A healthy Grok worker often
-makes no write for 5–8 minutes, including 2+ minutes with no tool call, then
-writes in a burst. Do not cancel early unless that token count has stopped
-moving for several minutes. Delegate itself ends a run only after 20 minutes
-with no runner output at all (stdout or `runner.log` growth), or at the
-4-hour hard cap; both limits take a seconds override in
-`DELEGATE_IDLE_TIMEOUT` / `DELEGATE_HARD_CAP`.
+Delegate itself ends a run only after 20 minutes with no runner output at all
+(stdout or `runner.log` growth), or at the 4-hour hard cap; both take a
+seconds override in `DELEGATE_IDLE_TIMEOUT` / `DELEGATE_HARD_CAP`. `wait
+--timeout` does not change them.
+
+The state directory is private (mode 0700): run dirs hold the prompt, the full
+transcript and provider args. A real run creates it that way, and every command
+tightens one an older version left open. Files the worker writes in your
+repository keep your umask.
 
 ## Grok sandbox
 
 Delegate always passes grok an explicit `--sandbox` value (`GROK_SANDBOX` cannot
-slip in) and always passes `--trust`. The sandbox value is:
+slip in) and always passes `--trust`, so a run never waits on
+`trusted_folders.toml`; `doctor` reports a saved grant as `info`. The sandbox
+value is:
 
 1. `off` under `--no-sandbox`
 2. `read-only` under `--read-only`. If this process is already sandboxed,
    grok refuse-starts; delegate then passes `off` and `--read-only` is the
-   post-run delta check (a changed tree still exits 2). Web stays off unless `--web`.
+   post-run delta check (a changed tree still exits 2), recorded as
+   `readOnlyEnforcement: "post-hoc"`. Web stays off unless `--web`.
 3. `--provider-arg sandbox=NAME` when given (`sandbox=off` is refused)
 4. else grok's built-in `workspace` (writes only `--cwd` + `~/.grok` + temp)
 
@@ -151,18 +191,38 @@ Every run writes one schema-3 JSON object to stdout and `result.json`
   checked-out branch or a local branch or tag is `error`, exit 2: the wrapper reports it
   and never repairs it. Its own git calls ignore the repo's fsmonitor, hooks, external
   diff and filter settings, so a diff shows raw file bytes.
-- `exitCode` — 0 success, 1 worker failure/cancel/timeout, 2 preflight/error.
+- `exitCode` — see [Exit codes](#exit-codes).
 - `error` — the runner's own failure message when its stream reports one;
   otherwise the stderr or preflight reason.
+- `errorKind` — `null` unless `error` is set; then `usage_limit` or `auth` (the
+  API's HTTP 429, or 401/403), `max_turns`, `timeout`, or `other`. It is read
+  from structured fields, never from the worker's text; the one prose match is
+  codex's own usage-limit message, which has no status. Other limits a runner
+  reports only in prose are `other`. On `usage_limit`, switch provider or wait
+  until `resetsAt` (UTC, when the runner gives one; claude does); delegate
+  never retries. Before any rerun, read a non-empty `diffPath`: the
+  next run's baseline includes those writes, so its delta will not show them.
 - `diffPath` / `diffStat` / `emptyDiff` — the **authoritative worker-delta**
   (a private snapshot before vs after; pre-existing dirt is excluded). The diff
-  is never inlined; open `diffPath` and read the whole thing.
-- `scope` / `scopeViolations` — paths that fell outside `--scope`.
+  is never inlined; open `diffPath` and read the whole thing. Snapshots cover
+  tracked and unignored new files, inside checked-out submodules too. Ignored
+  files, paths outside `--cwd` and a submodule's own `.git` are invisible;
+  unstat-able paths are skipped and named on stderr.
+- `baseCommit` / `dirtyBefore` — HEAD when the run started, and whether the tree
+  already had changes then (they are not in the delta). A moved HEAD, empty
+  commits included, fails exit 2: the wrapper never commits.
+- `scope` / `scopeViolations` — paths that fell outside `--scope`. Violations
+  are relative to the repository root, like the paths in `diffPath`.
 - `reportPath` / `reportExists` — the report contract.
 - `answerPath` — the worker's final message (`null` when none was captured).
-  `readOnly` echoes `--read-only`.
+  `readOnly` echoes `--read-only`. `readOnlyEnforcement` says what stopped
+  writes: `kernel` (grok's and codex's OS sandbox), `app` (claude's and
+  cursor's plan mode), `post-hoc` (only the delta check), or `null` without
+  `--read-only`.
 - `turns` / `costUsd` — `turns` is populated for grok, claude, codex, and pi;
   `costUsd` for grok, claude, and pi. Both are `null` for cursor.
+  `failedToolCalls` counts tool calls that reported failure;
+  `durationSeconds` is the wall time.
 - `providerExtra` — provider-only fields (a raw status, usage tokens, etc.).
   `providerExtra.usage` (grok, codex, and pi) holds input, output, reasoning,
   and cache-read tokens plus `requests`. It is kept on cancel and timeout.
@@ -174,33 +234,12 @@ respected): `result.json`, `stream.jsonl`, `runner.log`,
 `diff.patch`, `heartbeat`, `progress.json`, snapshot indexes, `command.json`
 (argv, prompt elided), `prompt.txt`. Diagnose a failed run from those files.
 
-## Important operating behavior
-
-1. **Runs never prompt.** Each provider's argv sets a non-prompting posture
-   (`--permission-mode auto`, `--approve-for-me`, `--force --trust`, …). An
-   unanswered permission prompt would read as a cancel.
-
-2. **Grok always gets `--trust`.** A run is not blocked on
-   `trusted_folders.toml`. `doctor` still reports the saved grant (a grant
-   covers its subdirectories, not a nested checkout).
-
-3. **Use the templates for multi-step work.** Copy and adapt
-   [`templates/rules.md`](templates/rules.md) and
-   [`templates/task.md`](templates/task.md), then pass them with `--rules` and
-   `--task`. Prefer small, reviewable tasks.
-
 ## Outcome and containment contract
 
-- One attempt. The wrapper never commits.
-- Moved HEAD (empty commits included) or snapshot failure → exit 2.
-- Empty diff is success.
-- Snapshots cover tracked + unignored new files. Ignored writes are invisible;
-  unstat-able paths are skipped and named on stderr.
-- `--scope` reports; it does not block. `.` / empty means the whole tree.
+- One attempt. The wrapper never commits, never retries and never repairs.
+- An empty diff is success.
 - `cancel`, SIGINT, and SIGTERM all clean up and emit `cancelled`.
 - SIGKILL cannot emit an envelope.
-- `wait --timeout` does not change the worker limits (20 min idle, 4 h hard cap).
-- Unsupported effort and turn-cap flags warn.
 
 ## Computer use (codex)
 
@@ -215,9 +254,9 @@ bin/delegate run --provider codex --computer-use --read-only \
 1. **Check the plugin:** `bin/delegate doctor --provider codex` prints
    `computer use: cua_repl plugin …` when Codex Desktop has installed it.
 2. **App approval stays with the user.** Computer Use asks per app, and a
-   headless run cannot answer, so an app works only once it has been approved:
-   - **"Always allow"** in an interactive Codex session (`codex`, then ask it to
-     open the app) → plain runs work from then on.
+   headless run cannot answer, so an app works only once you have chosen
+   **"Always allow"** for it in an interactive Codex session (`codex`, then ask
+   it to open the app).
 3. **A refusal fails the run** (exit 1): `error` names the app and the fix,
    and `providerExtra.computerUseDenied` lists the refused apps.
 

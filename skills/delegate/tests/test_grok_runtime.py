@@ -10,7 +10,6 @@ import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,17 +21,11 @@ from delegate import cli, core, jobs  # noqa: E402
 from delegate.providers import grok as grokmod  # noqa: E402
 from delegate.providers.base import Job  # noqa: E402
 from delegate.providers.grok import Grok  # noqa: E402
+from tests.helpers import init_repo  # noqa: E402
 
 
 def _repo(path: Path) -> Path:
-    path.mkdir(parents=True)
-    run = lambda *a: subprocess.run(["git", "-C", str(path), *a], check=True,
-                                    capture_output=True)
-    run("init", "-q")
-    (path / "f").write_text("f\n")
-    run("add", ".")
-    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
-    return path.resolve()
+    return init_repo(path, {"f": "f\n"}).resolve()
 
 
 class TrustTests(unittest.TestCase):
@@ -40,8 +33,9 @@ class TrustTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
-        self.trust_file = self.root / "trusted_folders.toml"
-        patcher = patch.object(grokmod, "_TRUST_FILE", self.trust_file)
+        (self.root / ".grok").mkdir()
+        self.trust_file = self.root / ".grok" / "trusted_folders.toml"
+        patcher = patch.dict(os.environ, {"HOME": str(self.root)})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.repo = _repo(self.root / "projects" / "repo")
@@ -53,7 +47,7 @@ class TrustTests(unittest.TestCase):
             f'[folders."{f}"]\ntrusted = true\ndecided_at = 1\n\n' for f in folders))
 
     def verdict(self, cwd):
-        return Grok().trust(cwd)
+        return grokmod.saved_grant(cwd)
 
     def test_exact_repo_root(self):
         self.trust(self.repo)
@@ -83,9 +77,30 @@ class TrustTests(unittest.TestCase):
     def test_missing_trust_file(self):
         self.assertFalse(self.verdict(self.repo)[0])
 
+    def doctor(self):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"XAI_API_KEY": "offline"}), \
+             patch("delegate.cli.shutil.which", return_value="/usr/bin/grok"), \
+             redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = cli.main(["doctor", "--provider", "grok", "--cwd", str(self.repo)])
+        return code, out.getvalue()
+
+    def test_doctor_reports_a_missing_grant_without_failing(self):
+        code, out = self.doctor()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"info grok  : grok has not trusted {self.repo}", out)
+
+    def test_doctor_reports_a_saved_grant(self):
+        self.trust(self.repo)
+        code, out = self.doctor()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"ok   grok  : {self.repo} trusted", out)
+
     def test_a_run_does_not_block_on_the_saved_grant(self):
         job = Job("grok", self.repo, "t", "r", self.repo)
-        self.assertIsNone(Grok().trust(self.repo, job))
+        with patch.dict(os.environ, {"XAI_API_KEY": "offline"}), \
+             patch("delegate.core.shutil.which", return_value="/usr/bin/grok"):
+            core.preflight(job, Grok())  # untrusted repo, no Preflight raised
 
 
 class Scripted(Grok):
@@ -93,9 +108,6 @@ class Scripted(Grok):
 
     def __init__(self, script):
         self.script = script
-
-    def trust(self, cwd, job=None):
-        return None
 
     def argv(self, job):
         return ["-c", self.script]
@@ -173,32 +185,6 @@ class PostureTests(unittest.TestCase):
         self.assertEqual(code, 64, err.getvalue())
         return err.getvalue()
 
-    def test_default_sandbox_is_workspace_and_trusts(self):
-        argv = self.dry()
-        self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace")
-        self.assertIn("--trust", argv)
-
-    def test_no_sandbox_is_explicit_off(self):
-        argv = self.dry("--no-sandbox")
-        self.assertEqual(argv[argv.index("--sandbox") + 1], "off")
-
-    def test_restrict_only_extras_reach_grok(self):
-        argv = self.dry("--provider-arg", "disallowed-tools=web_search,web_fetch",
-                        "--provider-arg", "deny=*__*", "--provider-arg", "no-memory=true")
-        self.assertEqual(argv[argv.index("--disallowed-tools") + 1], "web_search,web_fetch")
-        self.assertEqual(argv[argv.index("--deny") + 1], "*__*")
-        self.assertIn("--no-memory", argv)
-
-    def test_sandbox_extra_reaches_grok(self):
-        argv = self.dry("--provider-arg", "sandbox=personal")
-        self.assertEqual(argv[argv.index("--sandbox") + 1], "personal")
-
-    def test_read_only_is_the_read_only_profile(self):
-        argv = self.dry("--read-only")
-        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
-        self.assertIn("--trust", argv)
-        self.assertIn("--disable-web-search", argv)
-
     def test_grok_agent_does_not_change_the_sandbox(self):
         with patch.dict(os.environ, {"GROK_AGENT": "1"}):
             argv = self.dry()
@@ -220,6 +206,7 @@ class PostureTests(unittest.TestCase):
         self.assertIn("--trust", argv)
         self.assertIn("--disable-web-search", argv)
         self.assertIn("post-run delta check", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["readOnlyEnforcement"], "post-hoc")
 
     def test_read_only_inherits_when_a_probe_says_refused(self):
         out, err = io.StringIO(), io.StringIO()
@@ -233,6 +220,7 @@ class PostureTests(unittest.TestCase):
         argv = json.loads(out.getvalue())["providerExtra"]["argv"]
         self.assertEqual(argv[argv.index("--sandbox") + 1], "off")
         self.assertIn("--disable-web-search", argv)
+        self.assertEqual(json.loads(out.getvalue())["readOnlyEnforcement"], "post-hoc")
 
     def test_sandbox_off_via_provider_arg_is_refused(self):
         err = self.refused("--provider-arg", "sandbox=off")

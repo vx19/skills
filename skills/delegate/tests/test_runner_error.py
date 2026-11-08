@@ -6,7 +6,6 @@ real log or a real home directory.
 import errno
 import io
 import os
-import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -16,6 +15,7 @@ from unittest.mock import patch
 from delegate import core
 from delegate.providers.base import Job
 from delegate.providers.pi import Pi
+from tests.helpers import git, init_repo  # noqa: E402
 
 # Pi died in under a second; the useful line does not start with `error:`.
 PI_LOG = (
@@ -82,12 +82,7 @@ class PiPreflightTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
-        self.git("init", "-q")
-        (self.repo / "base").write_text("base\n")
-        self.git("add", ".")
-        self.git("-c", "user.name=test", "-c", "user.email=test@test", "commit", "-qm", "initial")
+        self.repo = init_repo(self.root / "repo")
         bindir = self.root / "bin"
         bindir.mkdir()
         pi = bindir / "pi"
@@ -100,7 +95,7 @@ class PiPreflightTests(unittest.TestCase):
         }
 
     def git(self, *args):
-        subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
+        git(self.repo, *args)
 
     def job(self, **extra):
         return Job("pi", self.repo, "task", "run", self.root / "run", extra=extra)

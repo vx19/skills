@@ -1,0 +1,8 @@
+{"type":"session","id":"s-1"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Fin"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"ished."}}
+{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":10,"output":4,"cacheRead":0,"reasoning":0,"cost":{"total":0.003}}}}
+{"type":"turn_end","message":{"role":"assistant","usage":{"input":10,"output":4}}}
+{"type":"agent_end","willRetry":false}

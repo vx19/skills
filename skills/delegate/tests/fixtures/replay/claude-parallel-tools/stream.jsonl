@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/work/repo","session_id":"s-1","model":"example-model"}
+{"type":"assistant","message":{"model":"example-model","role":"assistant","content":[{"type":"text","text":"Reading both."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/work/repo/a.txt"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/work/repo/missing.txt"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a"},{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"File does not exist."}]}}
+{"type":"assistant","message":{"model":"example-model","role":"assistant","content":[{"type":"text","text":"One file is missing."}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":"One file is missing."}

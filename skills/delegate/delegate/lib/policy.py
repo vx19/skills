@@ -3,27 +3,19 @@
 from __future__ import annotations
 
 import fnmatch
+import posixpath
 
 
 def path_matches(path: str, pattern: str) -> bool:
-    path_n = path.replace("\\", "/").lstrip("./")
-    pat = pattern.replace("\\", "/").lstrip("./")
-    if not pat:
-        return False
-    if pat.endswith("/"):
-        return path_n == pat[:-1] or path_n.startswith(pat)
-    if fnmatch.fnmatch(path_n, pat):
-        return True
-    # directory-prefix convenience: "src" matches "src/foo.py"
-    return path_n == pat or path_n.startswith(pat + "/")
+    """True when `path` is `pattern`, lies under it, or matches it as a glob.
+
+    Both are normalised first, so `./src/` is `src` and `.` (or empty) is the
+    whole tree; a name such as `.src` is never mistaken for `src`.
+    """
+    path, pat = posixpath.normpath(path), posixpath.normpath(pattern or ".")
+    return (pat == "." or path == pat or path.startswith(pat + "/")
+            or fnmatch.fnmatch(path, pat))
 
 
-def violations(paths: list[str], allow: list[str], deny: list[str]) -> list[str]:
-    out: list[str] = []
-    for p in paths:
-        if deny and any(path_matches(p, d) for d in deny):
-            out.append(p)
-            continue
-        if allow and not any(path_matches(p, a) for a in allow):
-            out.append(p)
-    return out
+def violations(paths: list[str], allow: list[str]) -> list[str]:
+    return [p for p in paths if not any(path_matches(p, a) for a in allow)]

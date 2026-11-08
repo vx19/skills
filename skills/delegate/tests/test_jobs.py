@@ -40,8 +40,19 @@ class TestJobs(unittest.TestCase):
                                   scope=["packages/core"], status="running",
                                   pid=os.getpid())
         rec.save()
-        self.assertIn("r2", self.jobs.scope_overlap(["packages/core"]))
-        self.assertEqual(self.jobs.scope_overlap(["totally/other"]), [])
+        self.assertIn("r2", self.jobs.scope_overlap(Path("/tmp"), ["packages/core"]))
+        self.assertEqual(self.jobs.scope_overlap(Path("/tmp"), ["totally/other"]), [])
+
+    def test_scope_overlap_sees_nesting_the_whole_tree_and_other_cwds(self):
+        for run_id, cwd, scope in (("nested", "/r", ["src"]), ("whole", "/w", ["."]),
+                                   ("unscoped", "/u", []), ("sub", "/s/pkg", ["src"])):
+            self.jobs.JobRecord(run_id=run_id, provider="grok", cwd=cwd, scope=scope,
+                                status="running", pid=os.getpid()).save()
+        self.assertEqual(self.jobs.scope_overlap(Path("/r"), ["src/api"]), ["nested"])
+        self.assertEqual(self.jobs.scope_overlap(Path("/w"), ["docs"]), ["whole"])
+        self.assertEqual(self.jobs.scope_overlap(Path("/u"), ["lib"]), ["unscoped"])
+        self.assertEqual(self.jobs.scope_overlap(Path("/s"), ["pkg/src/x.py"]), ["sub"])
+        self.assertEqual(self.jobs.scope_overlap(Path("/elsewhere"), ["src"]), [])
 
     def test_dead_pid_no_result_not_live(self):
         # a pid that is (almost certainly) not alive
@@ -69,6 +80,8 @@ class TestLivenessLock(unittest.TestCase):
             fd = jobs.hold_live_lock("r1")
             self.assertTrue(jobs.wrapper_alive("r1"), "lock held")
             self.assertTrue(jobs.is_wrapper_alive(rec))
+            with self.assertRaises(jobs.RunIdCollision):
+                jobs.hold_live_lock("r1")  # a second wrapper for a live run
             os.close(fd)  # the kernel drops the lock with the fd
             self.assertFalse(jobs.wrapper_alive("r1"), "lock released")
             self.assertFalse(jobs.is_wrapper_alive(rec))
@@ -240,6 +253,168 @@ class TestSettleDead(unittest.TestCase):
         self.assertIsNone(self.jobs.settle_dead(rec))
         self.assertEqual(result.read_bytes(), before)
 
+    def test_a_recovered_retry_is_not_the_dead_run_reason(self):
+        rec = self.jobs.JobRecord(run_id="retried", provider="codex", cwd="/work",
+                                  status="running", pid=999999)
+        rec.save()
+        (self.jobs.run_dir_for("retried") / "stream.jsonl").write_text(
+            '{"type":"error","message":"Reconnecting... 1/5"}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n')
+        payload = self.jobs.settle_dead(rec)
+        self.assertEqual(payload["error"], "wrapper died before writing a result")
+
+    def _orphaned_run(self, run_id):
+        """A repo, its run baseline, and a dead wrapper and worker."""
+        import subprocess
+        from delegate.lib.snapshot import snapshot_tree
+        from tests.helpers import init_repo
+        repo = init_repo(Path(self.tmp.name) / f"repo-{run_id}", {"base.txt": "base\n"})
+        dead = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"],
+                              capture_output=True, text=True, check=True)
+        dead_pid = int(dead.stdout)
+        rec = self.jobs.JobRecord(run_id=run_id, provider="grok", cwd=str(repo),
+                                  status="running", pid=dead_pid, worker_pid=dead_pid,
+                                  scope=["src/"])
+        rec.save()
+        snapshot_tree(repo, self.jobs.run_dir_for(run_id) / "index0")
+        return rec, repo
+
+    def test_a_dead_run_reports_what_the_worker_wrote(self):
+        rec, repo = self._orphaned_run("orphan")
+        (repo / "new.txt").write_text("written after the baseline\n")
+        payload = self.jobs.settle_dead(rec)
+        self.assertFalse(payload["emptyDiff"])
+        self.assertIn("new.txt", Path(payload["diffPath"]).read_text())
+        self.assertEqual(payload["scopeViolations"], ["new.txt"])
+
+    def test_a_dead_run_does_not_flag_its_requested_report(self):
+        rec, repo = self._orphaned_run("reporter")
+        rec.report = str(repo / "REPORT.md")
+        rec.save()
+        (repo / "REPORT.md").write_text("report\n")
+        (repo / "new.txt").write_text("stray\n")
+        payload = self.jobs.settle_dead(self.jobs.read_job("reporter"))
+        self.assertEqual(payload["scopeViolations"], ["new.txt"])
+
+    def test_a_dead_run_that_wrote_nothing_has_an_empty_delta(self):
+        rec, _ = self._orphaned_run("idle")
+        payload = self.jobs.settle_dead(rec)
+        self.assertTrue(payload["emptyDiff"])
+        self.assertIsNone(payload["diffPath"])
+
+    def _orphaned_worker(self):
+        """A worker group whose launcher already exited, like a dead wrapper's
+        worker: its own session, a background child, reparented to init."""
+        import subprocess
+        worker = ("import subprocess, sys, time\n"
+                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                  "time.sleep(60)\n")
+        launcher = ("import subprocess, sys\n"
+                    f"p = subprocess.Popen([sys.executable, '-c', {worker!r}], start_new_session=True,\n"
+                    "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                    "print(p.pid)\n")
+        out = subprocess.run([sys.executable, "-c", launcher], capture_output=True,
+                             text=True, check=True)
+        pid = int(out.stdout)
+        self.addCleanup(self._kill_group_quietly, pid)
+        return pid
+
+    @staticmethod
+    def _kill_group_quietly(pgid):
+        import signal
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    def test_cancel_stops_the_worker_of_a_dead_wrapper(self):
+        rec, repo = self._orphaned_run("orphan-cancel")
+        rec.worker_pid = self._orphaned_worker()
+        rec.save()
+        (repo / "late.txt").write_text("the orphan kept writing\n")
+        ok, msg = self.jobs.cancel("orphan-cancel")
+        self.assertTrue(ok, msg)
+        self.assertTrue(self.jobs._worker_group_gone(rec), "worker group survived cancel")
+        result = self.jobs.read_result("orphan-cancel")
+        self.assertEqual(result["error"], "wrapper died before writing a result")
+        self.assertIn("late.txt", Path(result["diffPath"]).read_text())
+
+    def test_cancel_never_signals_a_process_that_reused_the_pid(self):
+        rec, _ = self._orphaned_run("recycled")
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        rec.worker_pid = child.pid  # alive, but in the test's group: not the worker's
+        rec.save()
+        ok, msg = self.jobs.cancel("recycled")
+        self.assertTrue(ok, msg)
+        self.assertIsNone(child.poll(), "cancel signalled a process outside the worker group")
+
+    def test_cancel_stops_a_group_whose_leader_already_exited(self):
+        rec, _ = self._orphaned_run("leaderless-cancel")
+        rec.worker_pid = self._leaderless_group()
+        rec.save()
+        ok, msg = self.jobs.cancel("leaderless-cancel")
+        self.assertTrue(ok, msg)
+        self.assertTrue(self.jobs._worker_group_gone(rec))
+
+    @staticmethod
+    def _zombie(new_group=False):
+        """A child that has exited and that we have not reaped."""
+        pid = os.fork()
+        if pid == 0:
+            if new_group:
+                os.setsid()
+            os._exit(0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:  # until it has exited, unreaped
+            try:
+                os.getpgid(pid)
+            except ProcessLookupError:
+                break
+            if Path(f"/proc/{pid}/stat").is_file() and \
+                    Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                break
+            time.sleep(0.01)
+        return pid
+
+    def test_a_zombie_is_not_alive(self):
+        pid = self._zombie()
+        self.addCleanup(os.waitpid, pid, 0)
+        self.assertFalse(self.jobs.pid_alive(pid))
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "needs /proc (Linux)")
+    def test_a_group_of_only_zombies_is_gone(self):
+        pid = self._zombie(new_group=True)
+        self.addCleanup(os.waitpid, pid, 0)
+        rec = self.jobs.JobRecord(run_id="zombie-group", provider="grok", cwd="/work",
+                                  worker_pid=pid)
+        self.assertTrue(self.jobs._worker_group_gone(rec))
+
+    def test_a_group_whose_leader_exited_is_alive_while_a_member_runs(self):
+        rec = self.jobs.JobRecord(run_id="leaderless", provider="grok", cwd="/work",
+                                  worker_pid=self._leaderless_group())
+        self.assertFalse(self.jobs._worker_group_gone(rec),
+                         "the leader exited but its group still has a writer")
+
+    def _leaderless_group(self):
+        """A worker group whose leader exited, leaving a background member."""
+        import subprocess
+        worker = ("import subprocess, sys\n"
+                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+                  "                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n")
+        launcher = ("import subprocess, sys\n"
+                    f"p = subprocess.Popen([sys.executable, '-c', {worker!r}], start_new_session=True,\n"
+                    "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                    "p.wait()\n"
+                    "print(p.pid)\n")
+        out = subprocess.run([sys.executable, "-c", launcher], capture_output=True,
+                             text=True, check=True)
+        leader = int(out.stdout)
+        self.addCleanup(self._kill_group_quietly, leader)
+        return leader
+
     def test_live_wrapper_writes_nothing(self):
         rec = self._rec("live", pid=os.getpid())
         fd = self.jobs.hold_live_lock("live")
@@ -250,7 +425,12 @@ class TestSettleDead(unittest.TestCase):
         self.assertFalse((self.jobs.run_dir_for("live") / "result.json").exists())
 
     def test_live_worker_group_writes_nothing(self):
-        rec = self._rec("worker-live", worker_pid=os.getpid())
+        import subprocess
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                  start_new_session=True)
+        self.addCleanup(worker.wait)
+        self.addCleanup(worker.kill)
+        rec = self._rec("worker-live", worker_pid=worker.pid)
         self.assertIsNone(self.jobs.settle_dead(rec))
         self.assertFalse((self.jobs.run_dir_for("worker-live") / "result.json").exists())
 

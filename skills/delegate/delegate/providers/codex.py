@@ -21,7 +21,7 @@ import os
 import re
 from pathlib import Path
 
-from .base import Event, Job, Provider, usage_tokens
+from .base import Event, Job, Provider, status_kind, usage_tokens
 
 # What the Computer Use tool returns when the user has not approved an app.
 DENIED = re.compile(r"Computer Use was not approved to use ([^\n]+?)\s*$", re.MULTILINE)
@@ -81,7 +81,9 @@ class Codex(Provider):
     parses_stream = True
     read_only = "kernel"
     answers = True
+    supports = frozenset({"effort", "no_sandbox"})
     computer_use = True
+    prompt_via = "stdin"
 
     def answer_file(self, job: Job) -> Path | None:
         return job.run_dir / "answer.txt"
@@ -93,7 +95,6 @@ class Codex(Provider):
         # `--approve-for-me` auto-approves inside codex's workspace-write
         # sandbox and is mutually exclusive with `--sandbox`, so we never pass
         # both. `--no-sandbox` maps to the documented full-access bypass.
-        # codex exec takes the prompt as a positional (no `--` separator).
         args = ["exec", "--cd", str(job.cwd), "--skip-git-repo-check",
                 "--json", "--ephemeral"]
         if job.no_sandbox:
@@ -110,19 +111,11 @@ class Codex(Provider):
             args += ["-m", job.model]
         if job.effort:
             args += ["-c", f'model_reasoning_effort="{job.effort}"']
-        return args + [job.prompt]
+        return args + ["-"]  # the prompt comes on stdin
 
-    def parse(self, line: str) -> Event | None:
-        line = line.strip()
-        if not line or line[0] != "{":
-            return None
-        try:
-            data = json.loads(line)
-        except ValueError:
-            return None
-        if not isinstance(data, dict):
-            return None
-        return _parse_event(data)
+    def events(self, data: dict) -> list[Event]:
+        ev = _parse_event(data)
+        return [ev] if ev else []
 
     def finish(self, job: Job, env, returncode: int) -> None:
         if not job.computer_use or not env.stream_path:
@@ -195,12 +188,20 @@ def _first_changed_path(changes) -> str | None:
     return None
 
 
+_USAGE_LIMIT = "hit your usage limit"
+
+
 def _error_event(message) -> Event | None:
     if not isinstance(message, str):
         return None
     # An API refusal arrives as a JSON document inside the message string.
     try:
-        inner = json.loads(message)["error"]["message"]
-    except (ValueError, TypeError, KeyError):
-        inner = None
-    return Event(kind="error", text=inner if isinstance(inner, str) else message)
+        doc = json.loads(message)
+        inner, status = doc["error"]["message"], doc.get("status")
+    except (ValueError, TypeError, KeyError, AttributeError):
+        inner, status = None, None
+    if not isinstance(inner, str):
+        # Codex reports a usage limit only as this prose, with no status.
+        kind = "usage_limit" if _USAGE_LIMIT in message.lower() else None
+        return Event(kind="error", text=message, error_kind=kind)
+    return Event(kind="error", text=inner, error_kind=status_kind(status))

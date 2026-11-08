@@ -18,7 +18,7 @@ SCHEMA_VERSION = 3
 
 # Terminal states. A run ends in exactly one.
 STOP_END = "end_turn"          # provider finished normally
-STOP_CANCELLED = "cancelled"   # killed via `delegate cancel`, or provider self-cancel
+STOP_CANCELLED = "cancelled"   # killed via `delegate cancel`, SIGINT or SIGTERM
 STOP_TIMEOUT = "timeout"       # exceeded the outer wall clock
 STOP_ERROR = "error"           # provider crashed / non-success exit / preflight failure
 
@@ -49,6 +49,9 @@ class Envelope:
     stop_reason: str | None = None
     exit_code: int = 0
     error: str | None = None
+    # usage_limit | auth | max_turns | timeout | other; set with error, by fail()
+    error_kind: str | None = None
+    resets_at: str | None = None  # UTC time a usage_limit window reopens, if the runner says
     # worker signal
     turns: int | None = None
     cost_usd: float | None = None
@@ -63,6 +66,7 @@ class Envelope:
     scope: list[str] = field(default_factory=list)
     scope_violations: list[str] = field(default_factory=list)
     read_only: bool = False
+    read_only_enforcement: str | None = None  # kernel | app | post-hoc
     # the worker's final message, written by core (or the runner) after the run
     answer_path: str | None = None
     # report contract
@@ -85,6 +89,8 @@ class Envelope:
             "stopReason": self.stop_reason or None,
             "exitCode": int(self.exit_code),
             "error": self.error or None,
+            "errorKind": self.error_kind,
+            "resetsAt": self.resets_at,
             "turns": self.turns,
             "costUsd": self.cost_usd,
             "failedToolCalls": int(self.failed_tool_calls or 0),
@@ -97,6 +103,7 @@ class Envelope:
             "scope": list(self.scope),
             "scopeViolations": list(self.scope_violations),
             "readOnly": bool(self.read_only),
+            "readOnlyEnforcement": self.read_only_enforcement or None,
             "answerPath": self.answer_path or None,
             "reportPath": self.report_path or None,
             "reportExists": self.report_exists,
@@ -106,6 +113,12 @@ class Envelope:
             "dryRun": bool(self.dry_run),
             "providerExtra": dict(self.provider_extra),
         }
+
+    def fail(self, error: str, exit_code: int, kind: str = "other",
+             stop: str = STOP_ERROR) -> None:
+        """End the run as failed: why, what kind of failure, how it stopped, the exit code."""
+        self.error, self.error_kind = error, kind
+        self.stop_reason, self.exit_code = stop, exit_code
 
     def emit(self) -> None:
         write(self.to_json())

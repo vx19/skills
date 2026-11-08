@@ -12,7 +12,6 @@ the object itself is saved as `answer.json` so a caller never re-parses prose.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 
@@ -39,38 +38,29 @@ def instruction(schema: dict) -> str:
             + json.dumps(schema, indent=2))
 
 
-_FENCE = re.compile(r"```(?:json)?[ \t]*\n(.*?)```", re.DOTALL)
-
-
-def _loads(candidate: str):
-    try:
-        return json.loads(candidate)
-    except ValueError:
-        return None
-
-
 def parse(text: str) -> dict:
     """The answer's JSON object.
 
-    Models narrate. So accept, in order: the whole answer, the last fenced
-    block, or the span from the first `{` to the last `}`, whichever first
-    parses as one JSON object.
+    Models narrate, so this takes the last JSON object in the text that is not
+    nested in another one. Prose braces (`{x}`) and code fences are skipped.
     """
-    body = text.strip()
-    whole = _loads(body)
-    if isinstance(whole, dict):
-        return whole
-    candidates = [block.strip() for block in _FENCE.findall(body)[-1:]]
-    start, end = body.find("{"), body.rfind("}")
-    if 0 <= start < end:
-        candidates.append(body[start:end + 1])
-    for candidate in candidates:
-        obj = _loads(candidate)
-        if isinstance(obj, dict):
-            return obj
-    if whole is not None:
-        raise SchemaError("answer is not a JSON object")
-    raise SchemaError("answer holds no JSON object")
+    decoder = json.JSONDecoder()
+    last, i = None, text.find("{")
+    while i != -1:
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            end = i + 1
+        else:
+            last = obj
+        i = text.find("{", end)
+    if last is not None:
+        return last
+    try:
+        json.loads(text)
+    except ValueError:
+        raise SchemaError("answer holds no JSON object") from None
+    raise SchemaError("answer is not a JSON object")
 
 
 def check(text: str | None, schema: dict) -> tuple[dict | None, str | None]:

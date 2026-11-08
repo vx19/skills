@@ -7,8 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .constants import STATE_DIRNAME
 from .gitguard import hardened
+
+STATE_DIRNAME = "delegate"
 
 
 def state_root() -> Path:
@@ -65,23 +66,6 @@ def git_toplevel(cwd: Path) -> Path | None:
         return None
     raw = (proc.stdout or "").strip()
     return Path(raw).resolve() if raw else None
-
-
-def git_common_dir(cwd: Path) -> Path | None:
-    proc = subprocess.run(
-        ["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    raw = (proc.stdout or "").strip()
-    if not raw:
-        return None
-    p = Path(raw)
-    if not p.is_absolute():
-        p = cwd / p
-    return p.resolve()
 
 
 def git_dirty(cwd: Path) -> bool:

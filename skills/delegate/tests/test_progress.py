@@ -1,7 +1,6 @@
 """Live progress.json and grok usage totals. Offline, synthetic lines only."""
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -14,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from delegate import core, jobs
 from delegate.providers.base import Event, Job
 from delegate.providers.grok import Grok
+from tests.helpers import init_repo  # noqa: E402
 from test_core import Fake
 
 
@@ -108,13 +108,7 @@ class ProgressRunTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
-        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
-        (self.repo / "base").write_text("base\n")
-        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=test", "-c", "user.email=test@test",
-                        "commit", "-qm", "initial"], check=True, capture_output=True)
+        self.repo = init_repo(self.root / "repo")
         self.env = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
         self.env.start()
         self.addCleanup(self.env.stop)

@@ -2,10 +2,12 @@
 
 Subcommands: run | status | wait | result | logs | cancel | doctor.
 
-The command string the user types must be stable
-and match the sandbox allow/exempt patterns, so every input is a flag (no env
-vars), and the CLI owns logging + backgrounding (no pipes, `&`, or nohup in the
-typed command). Bypass-class flags never appear here — they live in providers/.
+The command string the user types must be stable and match the sandbox
+allow/exempt patterns, so every per-run input is a flag, and the CLI owns
+logging + backgrounding (no pipes, `&`, or nohup in the typed command). Env
+vars only tune host-wide limits (`DELEGATE_IDLE_TIMEOUT`, `DELEGATE_HARD_CAP`,
+`DELEGATE_KEEP_DAYS`). Bypass-class flags never appear here — they live in
+providers/.
 """
 
 from __future__ import annotations
@@ -13,12 +15,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
@@ -26,7 +29,7 @@ from . import jobs as jobsmod
 from .answer import SchemaError, instruction, read_schema
 from .envelope import Envelope
 from .lib.paths import git_head, git_ok, host_label
-from .prompt import PromptError, assemble, read_rules, read_task
+from .prompt import PromptError, assemble, check_argument_size, read_rules, read_task
 from .providers import NAMES, get
 from .providers.base import Job
 
@@ -40,7 +43,9 @@ def _die(code: int, msg: str) -> "int":
 
 
 def _new_run_id() -> str:
-    return datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(2)
+    # UTC never repeats an hour at a DST change; the claim in cmd_run refuses a
+    # collision that slips through anyway.
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4)
 
 
 # --------------------------------------------------------------------------- run
@@ -85,6 +90,8 @@ def _build_job(args) -> Job:
     if report is not None:
         task += f"\n\nWrite your report to {report} before final verification."
     prompt = assemble(task, rules, read_only=read_only, computer_use=computer_use)
+    if prov.prompt_via == "argv":
+        check_argument_size(prompt, provider)
 
     extra: dict[str, str] = {}
     for kv in args.provider_arg or []:
@@ -96,6 +103,10 @@ def _build_job(args) -> Job:
             raise PromptError(f"--provider-arg {k!r} is not read by {provider} "
                               f"(keys: {known})")
         extra[k] = v
+
+    # Codex puts the effort inside a TOML string; a plain word cannot escape it.
+    if args.effort is not None and not re.fullmatch(r"[a-z]+", args.effort):
+        raise PromptError(f"--effort must be one lowercase word (got {args.effort!r})")
 
     run_id = _new_run_id()
     job = Job(
@@ -131,11 +142,12 @@ def cmd_run(args) -> int:
         job = _build_job(args)
     except PromptError as e:
         return _die(USAGE_EXIT, str(e))
-    for flag, value, supported in (
-        ("--effort", job.effort, ("grok", "claude", "codex", "pi")),
-        ("--max-turns", job.max_turns, ("grok", "claude")),
+    for flag, value, key in (
+        ("--effort", job.effort, "effort"),
+        ("--max-turns", job.max_turns, "max_turns"),
+        ("--no-sandbox", job.no_sandbox or None, "no_sandbox"),
     ):
-        if value is not None and prov.name not in supported:
+        if value is not None and key not in prov.supports:
             print(f"delegate: warning: {flag} is not supported by {prov.name}; ignored",
                   file=sys.stderr)
     if job.web and not job.read_only:
@@ -146,7 +158,7 @@ def cmd_run(args) -> int:
               "its own default applies", file=sys.stderr)
 
     # Advisory overlap warning; it never blocks.
-    overlaps = jobsmod.scope_overlap(job.scope)
+    overlaps = jobsmod.scope_overlap(job.cwd, job.scope)
     if overlaps:
         print(f"delegate: warning: live job(s) {', '.join(overlaps)} may touch the "
               f"same paths as --scope {job.scope}", file=sys.stderr)
@@ -154,22 +166,17 @@ def cmd_run(args) -> int:
     if getattr(prov, "unsandboxed", False):
         print(f"delegate: warning: {prov.name} runs unsandboxed with your full user "
               "privileges (no filesystem isolation).", file=sys.stderr)
-    if prov.name == "grok":
-        from .providers.grok import read_only_inherit_warning
-        note = read_only_inherit_warning(job)
-        if note:
-            print(f"delegate: warning: {note}", file=sys.stderr)
-    # Preflight (skip the heavy checks on dry-run so it stays offline).
+    if prov.read_only_enforcement(job) == "post-hoc":
+        print(f"delegate: warning: {prov.name} cannot apply its read-only sandbox in this "
+              "process; --read-only is only the post-run delta check", file=sys.stderr)
+    # A dry run shows the argv only: no preflight, no launch.
     if not job.dry_run:
         jobsmod.prune_runs()
         try:
             core.preflight(job, prov)
         except core.Preflight as e:
-            env = Envelope(provider=prov.name, run_id=job.run_id, cwd=str(job.cwd))
-            env.read_only = job.read_only
-            env.stop_reason = "error"
-            env.exit_code = 2
-            env.error = str(e)
+            env = core.envelope_for(job, prov)
+            env.fail(str(e), 2)
             env.emit()
             return 2
 
@@ -178,22 +185,21 @@ def cmd_run(args) -> int:
             argv = prov.command(job)
         except ValueError as e:
             return _die(USAGE_EXIT, str(e))
-        env = Envelope(provider=prov.name, run_id=job.run_id, cwd=str(job.cwd))
-        env.dry_run = True
-        env.read_only = job.read_only
+        env = core.envelope_for(job, prov)
         env.stop_reason = "end_turn"
-        env.model = job.model
-        env.provider_extra = {"argv": argv}
+        # The prompt may reach the runner on stdin or in a file, not in argv.
+        env.provider_extra = {"argv": argv, "prompt": job.prompt}
         env.emit()
         return 0
 
+    jobsmod.make_state_root_private(create=True)  # before the run's first write
     try:
+        jobsmod.claim_run_dir(job.run_id)
         if args.background:
             return _run_background(job, prov)
         env = _run_foreground(job, prov, quiet=args.quiet)
     except jobsmod.RunIdCollision as e:
         return _die(2, str(e))
-    env.emit()
     return env.exit_code
 
 
@@ -202,7 +208,8 @@ def _run_foreground(job: Job, prov, *, quiet: bool) -> Envelope:
 
     rec = jobsmod.JobRecord(
         run_id=job.run_id, provider=prov.name, cwd=str(job.cwd),
-        scope=list(job.scope), status="running",
+        scope=list(job.scope), report=str(job.report) if job.report else None,
+        status="running",
         pid=os.getpid(), pgid=os.getpgid(0), started_at=time.time(),
         background=False,
     )
@@ -210,23 +217,19 @@ def _run_foreground(job: Job, prov, *, quiet: bool) -> Envelope:
     rec.save()
 
     env = core.run(job, prov, heartbeat=job.run_dir / "heartbeat", quiet=quiet)
-
-    result_tmp = job.run_dir / "result.tmp"
-    result_tmp.write_text(json.dumps(env.to_json(), indent=2), encoding="utf-8")
-    result_tmp.replace(job.run_dir / "result.json")
-    rec = jobsmod.read_job(job.run_id) or rec
-    rec.status = {0: "done"}.get(env.exit_code, env.stop_reason or "error")
-    rec.finished_at = time.time()
-    rec.save()
+    # Print before persisting, so a failed result.json write (a full disk)
+    # cannot cost the caller the envelope.
+    env.emit()
+    jobsmod.finalize(rec, env)
     return env
 
 
 def _run_background(job: Job, prov) -> int:
-    job.run_dir.mkdir(parents=True, exist_ok=True)
     # Record before forking so `status` sees it immediately.
     rec = jobsmod.JobRecord(
         run_id=job.run_id, provider=prov.name, cwd=str(job.cwd),
-        scope=list(job.scope), status="running", started_at=time.time(),
+        scope=list(job.scope), report=str(job.report) if job.report else None,
+        status="running", started_at=time.time(),
         background=True,
     )
     # Before the record is visible; the daemon inherits the fd across the double
@@ -246,17 +249,9 @@ def _run_background(job: Job, prov) -> int:
         env = core.run(
             job, prov, heartbeat=job.run_dir / "heartbeat", quiet=True)
     except Exception as e:  # never leave a job without a result
-        env = Envelope(provider=prov.name, run_id=job.run_id, cwd=str(job.cwd))
-        env.stop_reason = "error"
-        env.exit_code = 2
-        env.error = f"daemon crashed: {e}"
-    result_tmp = job.run_dir / "result.tmp"
-    result_tmp.write_text(json.dumps(env.to_json(), indent=2), encoding="utf-8")
-    result_tmp.replace(job.run_dir / "result.json")
-    rec = jobsmod.read_job(job.run_id) or rec
-    rec.status = {0: "done"}.get(env.exit_code, env.stop_reason or "error")
-    rec.finished_at = time.time()
-    rec.save()
+        env = core.envelope_for(job, prov)
+        env.fail(f"daemon crashed: {e}", 2)
+    jobsmod.finalize(rec, env)
     os._exit(0)
 
 
@@ -309,7 +304,7 @@ def _print_usage(result: dict) -> None:
 
 
 def cmd_wait(args) -> int:
-    deadline = time.time() + max(args.timeout, 0)
+    deadline = time.monotonic() + max(args.timeout, 0)  # a wall-clock step cannot end it
     run_id = args.job
     while True:
         rec = jobsmod.read_job(run_id)
@@ -331,7 +326,7 @@ def cmd_wait(args) -> int:
                 print(json.dumps(result))
                 return int(result.get("exitCode", 0))
             return _die(1, f"job {run_id} process gone with no result")
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             line = jobsmod.format_live_status(
                 rec, jobsmod.read_progress(run_id), time.time())
             return _die(WAIT_PENDING_EXIT, f"still running: {line}")
@@ -378,23 +373,21 @@ def _compact_logs(provider, lines: list[str]) -> list[str]:
             text.clear()
 
     for line in lines:
-        ev = provider.parse(line)
-        if ev is None:
-            continue
-        if ev.kind == "thought":
+        for ev in provider.parse(line):
+            if ev.kind == "thought":
+                flush_text()
+                thoughts += 1
+                continue
+            if ev.kind == "text":
+                flush_thoughts()
+                if ev.text:
+                    text.append(ev.text)
+                continue
             flush_text()
-            thoughts += 1
-            continue
-        if ev.kind == "text":
             flush_thoughts()
-            if ev.text:
-                text.append(ev.text)
-            continue
-        flush_text()
-        flush_thoughts()
-        msg = ev.compact()
-        if msg:
-            out.append(msg)
+            msg = ev.compact()
+            if msg:
+                out.append(msg)
     flush_text()
     flush_thoughts()
     return out
@@ -431,28 +424,20 @@ def cmd_doctor(args) -> int:
             print(f"FAIL {name}: unknown provider"); fails += 1; continue
         path = shutil.which(prov.runner)
         if path is None:
-            print(f"warn {name:6}: {prov.runner} not on PATH")
+            # A provider asked for by name must run; the full listing only surveys.
+            if args.provider:
+                print(f"FAIL {name:6}: {prov.runner} not on PATH"); fails += 1
+            else:
+                print(f"warn {name:6}: {prov.runner} not on PATH")
             continue
         print(f"ok   {name:6}: {prov.runner} -> {path}")
-        if name == "grok":
-            from .providers.grok import describe_sandbox
-            print(f"ok   {name:6}: sandbox {describe_sandbox()}")
-            cred = prov.preflight_check(
-                Job(name, cwd or Path("."), "", "doctor", cwd or Path(".")))
-            if cred:
-                print(f"FAIL {name:6}: {cred}"); fails += 1
-            else:
-                print(f"ok   {name:6}: credentials readable")
+        for level, text in prov.doctor(cwd):
+            print(f"{level:4} {name:6}: {text}")
+            fails += level == "FAIL"
         if prov.computer_use:
             ready, detail = prov.computer_use_status()
             # Optional capability: a missing plugin only matters for --computer-use.
             print(f"{'ok  ' if ready else 'warn'} {name:6}: computer use: {detail}")
-        if cwd is not None:
-            verdict = prov.trust(cwd)
-            if verdict is not None and verdict[0] is False:
-                print(f"FAIL {name:6}: {verdict[1]}"); fails += 1
-            elif verdict is not None:
-                print(f"ok   {name:6}: {cwd} trusted")
     if cwd is not None:
         if not git_ok(cwd):
             print(f"FAIL cwd: {cwd} is not a git work tree"); fails += 1
@@ -463,7 +448,6 @@ def cmd_doctor(args) -> int:
     return 2 if fails else 0
 
 
-# ------------------------------------------------------------------------ link
 # ------------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="delegate", description="Unified multi-provider delegate CLI.")
@@ -536,9 +520,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    jobsmod.make_state_root_private()
     try:
         return int(args.func(args) or 0)
-    except PromptError as e:
+    except (PromptError, jobsmod.InvalidJobId) as e:
         return _die(USAGE_EXIT, str(e))
     except KeyboardInterrupt:
         return 130

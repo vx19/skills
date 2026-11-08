@@ -1,7 +1,9 @@
-# Delegate rules (copy, edit, pass via --rules)
-
-Standing constraints for a delegated worker. The CLI prepends this whole file
-to the prompt. Keep it short and imperative; per-task specifics go in the task file.
+# Delegate rules
+<!--
+Standing constraints for a delegated worker: copy this file, edit it, pass it
+with --rules. The CLI prepends it to the prompt, without these comments. Keep
+it short and imperative; per-task specifics go in the task file.
+-->
 
 ## Reading budget
 - Never read a file longer than ~300 lines in full. Grep for the symbol first,
@@ -15,10 +17,6 @@ to the prompt. Keep it short and imperative; per-task specifics go in the task f
   (`tests/test_foo.py::test_bar`) — a passing single test hides collateral
   breakage in its neighbours.
 - Do not add, skip, or xfail tests to make a suite green.
-
-## Report ordering
-- Write the REPORT file **before** the final full-suite verification run. A
-  late cancel or timeout during that last run must not lose the report.
 
 ## Scope
 - Do not touch any path outside the stated in-scope list. If a fix seems to

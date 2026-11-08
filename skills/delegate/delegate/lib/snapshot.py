@@ -1,13 +1,17 @@
 """Worker-delta snapshots via a private git index.
 
 Never writes the repository's real `.git/index`. New files appear because
-`git add -A` runs against GIT_INDEX_FILE only.
+`git add -A` runs against GIT_INDEX_FILE only. The superproject's index holds
+only a commit id for each submodule, so every checked-out submodule gets its
+own private index beside the parent's, and its delta is diffed under its path.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,16 +26,24 @@ class SnapshotError(RuntimeError):
 def snapshot_tree(cwd: Path, index_file: Path) -> str:
     """Read HEAD + worktree into a private index and return the write-tree id."""
     env = _index_env(index_file)
-    _git(cwd, env, "read-tree", "HEAD", check=True)
+    _read_head(cwd, env)
     _add_all(cwd, env)
     proc = _git(cwd, env, "write-tree", check=True)
+    for path in _submodules(cwd, index_file):
+        snapshot_tree(cwd / path, _sub_index(index_file, path))
     return (proc.stdout or "").strip()
 
 
-def diff_from_tree(cwd: Path, tree_id: str, index_file: Path) -> str:
+def index_tree(cwd: Path, index_file: Path) -> str:
+    """The tree id of a saved private index, such as a run's baseline."""
+    proc = _git(cwd, _index_env(index_file), "write-tree", check=True)
+    return (proc.stdout or "").strip()
+
+
+def diff_from_tree(cwd: Path, tree_id: str, index_file: Path, prefix: str = "") -> str:
     """Private-index worktree snapshot minus ``tree_id`` (`git diff --cached`)."""
     env = _index_env(index_file)
-    _git(cwd, env, "read-tree", "HEAD", check=True)
+    _read_head(cwd, env)
     _add_all(cwd, env)
     proc = _git(
         cwd,
@@ -40,12 +52,38 @@ def diff_from_tree(cwd: Path, tree_id: str, index_file: Path) -> str:
         "diff",
         "--cached",
         "--no-color",
+        "--binary",
         "--no-ext-diff",
         "--no-textconv",
+        f"--src-prefix=a/{prefix}",
+        f"--dst-prefix=b/{prefix}",
         tree_id,
         check=True,
     )
     return proc.stdout or ""
+
+
+def submodule_diff(cwd: Path, index0: Path, index1: Path, prefix: str = "") -> str:
+    """The delta inside each submodule the baseline `index0` snapshotted."""
+    parts = []
+    for path in _submodules(cwd, index0):
+        sub0, sub1, at = _sub_index(index0, path), _sub_index(index1, path), f"{prefix}{path}/"
+        parts.append(diff_from_tree(cwd / path, index_tree(cwd / path, sub0), sub1, at))
+        parts.append(submodule_diff(cwd / path, sub0, sub1, at))
+    return "".join(parts)
+
+
+def _submodules(cwd: Path, index_file: Path) -> list[str]:
+    """Gitlinks in a private index whose work tree is checked out here."""
+    proc = _git(cwd, _index_env(index_file), "ls-files", "--stage", "-z", check=True)
+    paths = [entry.split("\t", 1)[1] for entry in proc.stdout.split("\0")
+             if entry.startswith("160000 ")]
+    return [path for path in paths if (cwd / path / ".git").exists()]
+
+
+def _sub_index(index_file: Path, path: str) -> Path:
+    digest = hashlib.sha256(path.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
+    return index_file.with_name(index_file.name + ".sub") / digest
 
 
 def diff_paths(diff_text: str) -> list[str]:
@@ -191,7 +229,22 @@ def _add_all(cwd: Path, env: dict[str, str]) -> None:
         excludes.extend(fresh)
         # A failed add can leave the private index half-updated. Rebuild it
         # before the next attempt so the exclude list is the only difference.
-        _git(cwd, env, "read-tree", "HEAD", check=True)
+        _read_head(cwd, env)
+
+
+def _read_head(cwd: Path, env: dict[str, str]) -> None:
+    """Load HEAD into the private index, keeping the real index's stat data.
+
+    `read-tree --reset` over a copy of the real index holds HEAD's content
+    only (staged and unmerged entries are dropped), but where a file matches
+    HEAD it keeps the cached stat data, so `add -A` hashes only what changed
+    instead of the whole work tree. The real index is only read.
+    """
+    plain = {k: v for k, v in env.items() if k != "GIT_INDEX_FILE"}
+    real = cwd / _git(cwd, plain, "rev-parse", "--git-path", "index", check=True).stdout.strip()
+    if real.is_file():
+        shutil.copyfile(real, env["GIT_INDEX_FILE"])
+    _git(cwd, env, "read-tree", "--reset", "HEAD", check=True)
 
 
 def _index_env(index_file: Path) -> dict[str, str]:

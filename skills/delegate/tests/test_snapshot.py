@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from delegate.lib.policy import violations  # noqa: E402
 from delegate.lib import snapshot as snap  # noqa: E402
+from tests.helpers import init_repo  # noqa: E402
 from delegate.lib.snapshot import (  # noqa: E402
     SnapshotError,
     diff_from_tree,
@@ -39,13 +40,7 @@ def _git(cwd: Path, *args: str, env: dict[str, str] | None = None) -> str:
 
 
 def _init_repo(root: Path) -> Path:
-    _git(root, "init", "-q")
-    _git(root, "config", "user.email", "t@t")
-    _git(root, "config", "user.name", "t")
-    (root / "tracked.txt").write_text("base\n", encoding="utf-8")
-    _git(root, "add", "tracked.txt")
-    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init")
-    return root
+    return init_repo(root, {"tracked.txt": "base\n"})
 
 
 class SnapshotTests(unittest.TestCase):
@@ -133,13 +128,10 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("weird file.txt", paths)
         self.assertIn("tab\tname.txt", paths)
         self.assertIn("café.txt", paths)
-        # deny-path would miss these if the parser returned []
-        self.assertEqual(
-            violations(paths, [], ["weird file.txt"]),
-            ["weird file.txt"],
-        )
+        # a scope check would miss these if the parser returned []
+        self.assertEqual(violations(paths, ["café.txt", "tab\tname.txt"]), ["weird file.txt"])
 
-    def test_allow_deny_ignore_preexisting_dirty(self) -> None:
+    def test_scope_ignores_preexisting_dirty(self) -> None:
         (self.repo / "other.txt").write_text("pre\n", encoding="utf-8")
         tree0 = snapshot_tree(self.repo, self.idx_dir / "index0")
         src = self.repo / "src"
@@ -148,9 +140,8 @@ class SnapshotTests(unittest.TestCase):
         delta = diff_from_tree(self.repo, tree0, self.idx_dir / "index1")
         paths = diff_paths(delta)
         self.assertEqual(paths, ["src/a.py"])
-        self.assertEqual(violations(paths, ["src/"], []), [])
-        self.assertEqual(violations(paths, ["src/"], ["secrets/"]), [])
-        self.assertEqual(violations(paths, [], ["src/"]), ["src/a.py"])
+        self.assertEqual(violations(paths, ["src/"]), [])
+        self.assertEqual(violations(paths, ["secrets/"]), ["src/a.py"])
 
     def test_latin1_content_roundtrips_through_the_diff(self) -> None:
         tree0 = snapshot_tree(self.repo, self.idx_dir / "index0")
@@ -161,6 +152,25 @@ class SnapshotTests(unittest.TestCase):
         patch = self.idx_dir / "diff.patch"
         patch.write_bytes(diff.encode("utf-8", errors="surrogateescape"))
         self.assertIn(raw, patch.read_bytes())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads mode 000")
+    def test_an_unchanged_tracked_file_is_not_reread(self) -> None:
+        # The private index reuses the real index's stat data, so a file that
+        # did not change is never hashed again; one nobody can read proves it.
+        # chmod moves ctime, so ctime must not count for this repo, and the file
+        # is older than the index, as real files are (git re-reads a "racily
+        # clean" entry written in the same second as the index).
+        _git(self.repo, "config", "core.trustctime", "false")
+        secret = self.repo / "secret.txt"
+        secret.write_text("s\n", encoding="utf-8")
+        os.utime(secret, (1_000_000_000, 1_000_000_000))
+        _git(self.repo, "add", "secret.txt")
+        _git(self.repo, "commit", "-qm", "secret")
+        secret.chmod(0)
+        (self.repo / "new.txt").write_text("n\n", encoding="utf-8")
+        tree = snapshot_tree(self.repo, self.idx_dir / "a")
+        self.assertEqual(diff_from_tree(self.repo, tree, self.idx_dir / "b"), "")
+        self.assertIn("new.txt", _git(self.repo, "ls-tree", "-r", "--name-only", tree))
 
     def test_add_failure_raises(self) -> None:
         index = self.idx_dir / "index-fail"
@@ -188,7 +198,7 @@ class SnapshotTests(unittest.TestCase):
             snap._add_all(self.repo, {})
         retry = [c for c in calls if ":(exclude)secret.env" in c]
         self.assertEqual(retry, [("add", "-A", "--", ".", ":(exclude)secret.env")])
-        self.assertIn(("read-tree", "HEAD"), calls)
+        self.assertIn(("read-tree", "--reset", "HEAD"), calls)
         self.assertIn("secret.env", err.getvalue())
 
     def test_same_unreadable_path_twice_still_fails(self) -> None:

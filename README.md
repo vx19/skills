@@ -6,7 +6,7 @@ A collection of self-contained agent skills.
 
 | Skill | Purpose | Requirements |
 | --- | --- | --- |
-| [delegate](skills/delegate/SKILL.md) | Dispatch a coding task to Grok, Claude Code, Codex, Cursor, or Pi and return its changes for review. | Python 3.10+, Git, POSIX for live runs, and the selected provider CLI. |
+| [delegate](skills/delegate/SKILL.md) | Dispatch a coding task to Grok, Claude Code, Codex, Cursor, or Pi and return its changes for review. | Python 3.11+, Git, POSIX for live runs, and the selected provider CLI. |
 | [github-ready](skills/github-ready/SKILL.md) | Prepare a local repository for GitHub publication or sharing with a bot: privacy, hygiene, docs, checks, readiness report. | An agent that can edit and run local commands, plus Git, Python 3.10+, and Bash. |
 
 ## Install

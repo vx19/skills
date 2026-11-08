@@ -1,49 +1,25 @@
 """Grok provider.
 
-Launch posture: `--permission-mode auto`
-(acceptEdits still prompts headlessly and the missing answer reads as cancel),
-`--no-plan --no-subagents`, `--output-format streaming-json`, prompt via
-`--single`. Every launch passes `--trust`, so a headless run from another
-harness accepts the working tree without an interactive folder prompt.
-`--read-only` uses grok's built-in `read-only` profile and adds
-`--disable-web-search` unless `--web`. When this process is already
-sandboxed, grok refuse-starts rather than apply that profile (it cannot
-write its hooks registry). Delegate then passes `--sandbox off` and the
-post-run delta check is what enforces `--read-only`. `--no-sandbox` passes
-`--sandbox off`
-explicitly, so a `GROK_SANDBOX` env cannot slip in.
-
-The write sandbox is otherwise built-in `workspace` (writes only `--cwd`,
-`~/.grok`, and temp). Delegate does not read `[sandbox] profile` from grok
-config: a custom profile is a second policy, and that is what makes a
-dispatch from another harness refuse to start. Pin one run with
-`--provider-arg sandbox=NAME`. `sandbox=off` is refused.
-`--provider-arg` otherwise stays restrict-only: `disallowed-tools=a,b`,
-`deny=RULE`, `no-memory=true`.
-
-`delegate doctor` still reports whether `~/.grok/trusted_folders.toml` grants
-the repo, and whether `~/.grok/auth.json` can be read. A run does not fail on
-the trust file: `--trust` is already on the argv. A grant covers the subdirectories of the same repository, not a nested
-checkout, so the doctor check walks up from --cwd to the git top level.
+Launch posture: `--permission-mode auto` (acceptEdits still prompts headlessly
+and the missing answer reads as cancel), `--no-plan --no-subagents`,
+`--output-format streaming-json`, `--trust` on every launch, and the prompt as
+`--prompt-file` (the run's prompt.txt). The `--sandbox` value is always explicit; `sandbox_for`
+says which. Grok's configured `[sandbox] profile` is never read: a second
+policy is what makes a dispatch from another harness refuse to start.
+`--provider-arg` stays restrict-only.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 from ..lib.paths import git_toplevel
-from .base import Event, Job, Provider, usage_tokens
+from .base import Event, Job, Provider, as_float, as_int, usage_tokens
 
-try:  # Python 3.11+
-    import tomllib  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None  # type: ignore
 
-_TRUST_FILE = Path.home() / ".grok" / "trusted_folders.toml"
 _APPLY_YES = frozenset({"yes", "1", "true"})
 _APPLY_NO = frozenset({"no", "0", "false"})
 _profile_probe: bool | None = None
@@ -113,15 +89,6 @@ def sandbox_for(job: Job) -> str:
     return "workspace"
 
 
-def read_only_inherit_warning(job: Job) -> str | None:
-    """Stderr note when --read-only could not apply its kernel profile."""
-    if not job.read_only or sandbox_for(job) != "off":
-        return None
-    return ("read-only profile cannot be applied in this process "
-            "(the parent sandbox refuses it); using --sandbox off. "
-            "--read-only is the post-run delta check")
-
-
 def describe_sandbox() -> str:
     """One doctor line: which profile a default grok dispatch would use."""
     return "workspace (default)"
@@ -134,7 +101,9 @@ class Grok(Provider):
     read_only = "kernel"
     web_toggle = True
     answers = True
+    supports = frozenset({"effort", "max_turns", "no_sandbox"})
     extra_keys = frozenset({"disallowed-tools", "deny", "no-memory", "sandbox"})
+    prompt_via = "file"
 
     def argv(self, job: Job) -> list[str]:
         args = ["--cwd", str(job.cwd), "--permission-mode", "auto",
@@ -155,8 +124,22 @@ class Grok(Provider):
             args += ["--model", job.model]
         if job.effort:
             args += ["--reasoning-effort", job.effort]
-        args += ["--single", job.prompt]
+        args += ["--prompt-file", str(job.run_dir / "prompt.txt")]
         return args
+
+    def doctor(self, cwd: Path | None) -> list[tuple[str, str]]:
+        lines = [("ok", f"sandbox {describe_sandbox()}")]
+        if cwd is not None:
+            trusted, hint = saved_grant(cwd)
+            lines.append(("ok", f"{cwd} trusted") if trusted else ("info", hint))
+        cred = self.preflight_check(Job(self.name, cwd or Path("."), "", "doctor", cwd or Path(".")))
+        lines.append(("FAIL", cred) if cred else ("ok", "credentials readable"))
+        return lines
+
+    def read_only_enforcement(self, job: Job) -> str | None:
+        if job.read_only and sandbox_for(job) == "off":
+            return "post-hoc"
+        return super().read_only_enforcement(job)
 
     def validate(self, job: Job) -> str | None:
         extra = (job.extra.get("sandbox") or "").strip()
@@ -189,32 +172,23 @@ class Grok(Provider):
             )
         return None
 
-    def trust(self, cwd: Path, job: Job | None = None) -> tuple[bool, str] | None:
-        # A run passes --trust, so the saved grant must not exit 2 before grok
-        # starts. Doctor calls this without a job and still reports the file.
-        if job is not None:
-            return None
-        target = cwd.resolve()
-        top = git_toplevel(target) or target
-        for folder in _up_to(target, top):
-            if _read_trusted(str(folder)):
-                return True, ""
-        hint = (
-            f"grok has not trusted {top}. Trust the repository once: "
-            f"`cd {top} && grok`, approve the folder-trust prompt, then quit "
-            f"(the grant covers its subdirectories)."
-        )
-        return False, hint
+    def events(self, data: dict) -> list[Event]:
+        ev = _parse_acp(data)
+        return [ev] if ev else []
 
-    def parse(self, line: str) -> Event | None:
-        line = line.strip()
-        if not line or line[0] != "{":
-            return None
-        try:
-            d = json.loads(line)
-        except ValueError:
-            return None
-        return _parse_acp(d)
+
+def saved_grant(cwd: Path) -> tuple[bool, str]:
+    """(trusted, hint) for grok's saved folder grant. Runs pass --trust and never need it."""
+    target = cwd.resolve()
+    top = git_toplevel(target) or target
+    for folder in _up_to(target, top):
+        if _read_trusted(str(folder)):
+            return True, ""
+    return False, (
+        f"grok has not trusted {top}; runs pass --trust and do not need it. "
+        f"To save a grant for interactive use: `cd {top} && grok`, approve the "
+        f"folder-trust prompt, then quit (the grant covers its subdirectories)."
+    )
 
 
 def _up_to(start: Path, top: Path):
@@ -229,27 +203,16 @@ def _up_to(start: Path, top: Path):
 
 
 def _read_trusted(target: str) -> bool:
-    if not _TRUST_FILE.is_file():
+    trust_file = Path.home() / ".grok" / "trusted_folders.toml"
+    if not trust_file.is_file():
         return False
-    text = _TRUST_FILE.read_text(encoding="utf-8", errors="replace")
-    if tomllib is not None:
-        try:
-            data = tomllib.loads(text)
-        except Exception:
-            data = None
-        if isinstance(data, dict):
-            folders = data.get("folders")
-            if isinstance(folders, dict):
-                entry = folders.get(target)
-                if isinstance(entry, dict) and entry.get("trusted") is True:
-                    return True
-                return False
-    # Fallback: match `[folders."<target>"]` ... `trusted = true` without a parser.
-    pat = re.compile(
-        r'\[folders\."' + re.escape(target) + r'"\]([^\[]*)', re.S
-    )
-    m = pat.search(text)
-    return bool(m and re.search(r"trusted\s*=\s*true", m.group(1)))
+    text = trust_file.read_text(encoding="utf-8", errors="replace")
+    try:
+        folders = tomllib.loads(text).get("folders")
+    except tomllib.TOMLDecodeError:
+        return False
+    entry = folders.get(target) if isinstance(folders, dict) else None
+    return isinstance(entry, dict) and entry.get("trusted") is True
 
 
 # Grok emits ACP session updates as NDJSON. The exact envelope is verified
@@ -266,8 +229,8 @@ def _parse_acp(d: dict) -> Event | None:
         return Event(
             kind="end",
             stop_reason=Provider._first(d, "stopReason", "stop_reason"),
-            turns=_int(Provider._first(d, "num_turns", "numTurns", "turns")),
-            cost_usd=_float(Provider._first(d, "total_cost_usd", "totalCostUsd", "cost_usd")),
+            turns=as_int(Provider._first(d, "num_turns", "numTurns", "turns")),
+            cost_usd=as_float(Provider._first(d, "total_cost_usd", "totalCostUsd", "cost_usd")),
         )
     # Reasoning chunk. Drop the text; live progress only needs the event.
     if t == "thought":
@@ -338,17 +301,3 @@ def _text_of(d: dict):
             if isinstance(inner, str):
                 return inner
     return None
-
-
-def _int(v):
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _float(v):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None

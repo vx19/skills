@@ -23,14 +23,13 @@ from .envelope import (
     Envelope,
     STOP_CANCELLED,
     STOP_END,
-    STOP_ERROR,
     STOP_TIMEOUT,
 )
-from .jobs import _fmt_duration, read_job
+from .jobs import _fmt_duration, group_alive, read_job
 from .lib import gitguard
-from .lib.paths import git_dirty, git_head, git_ok
+from .lib.paths import git_dirty, git_head, git_ok, git_toplevel
 from .lib.policy import violations
-from .lib.snapshot import diff_from_tree, diff_paths, snapshot_tree
+from .lib.snapshot import diff_from_tree, diff_paths, snapshot_tree, submodule_diff
 from .providers.base import Event, Job, Provider
 
 IDLE_TIMEOUT = 1200    # seconds of runner silence before the run ends
@@ -68,9 +67,6 @@ def preflight(job: Job, provider: Provider) -> None:
         raise Preflight(f"--cwd is not a git work tree: {job.cwd}")
     if git_head(job.cwd) is None:
         raise Preflight(f"git repo has no commit yet: {job.cwd}")
-    verdict = provider.trust(job.cwd, job)
-    if verdict is not None and verdict[0] is False:
-        raise Preflight(verdict[1])
     blocked = provider.preflight_check(job)
     if blocked:
         raise Preflight(blocked)
@@ -87,8 +83,10 @@ class _Accum:
         self.cost_usd: float | None = None
         self.failed_tool_calls = 0
         self.stop_reason: str | None = None
-        # The runner's latest error, until later progress shows it recovered.
+        # The runner's latest error and its kind, until later progress shows it recovered.
         self.error: str | None = None
+        self.error_kind: str | None = None
+        self.resets_at: int | None = None
         self.last_texts: list[str] = []
         # The final message: text since the last tool activity (grok streams it
         # in chunks), unless the runner's end event carries the whole answer.
@@ -130,12 +128,14 @@ class _Accum:
             self.cost_usd = ev.cost_usd
         if ev.stop_reason:
             self.stop_reason = ev.stop_reason
+        if ev.kind == "limit":
+            self.resets_at = ev.resets_at
         if ev.kind == "error":
-            self.error = ev.text or "error"
+            self.error, self.error_kind = ev.text or "error", ev.error_kind
         elif ev.kind in _PROGRESS_KINDS:
             # A runner that retries (codex "Reconnecting… 1/5") and then makes
             # progress has recovered; only an error at the end of the stream counts.
-            self.error = None
+            self.error = self.error_kind = None
         if ev.kind == "tool_result" and ev.ok is False:
             self.failed_tool_calls += 1
             self.counts["failed_tool"] += 1
@@ -175,12 +175,48 @@ def _record_answer(job: Job, provider: Provider, env: Envelope, acc: _Accum) -> 
     return text
 
 
-def _spawn(argv: list[str], cwd: Path, log_path: Path,
-           extra_env: dict[str, str]) -> subprocess.Popen:
-    with log_path.open("w", encoding="utf-8", errors="replace") as log:
+def envelope_for(job: Job, provider: Provider) -> Envelope:
+    """A fresh envelope carrying the job's own fields, before any outcome."""
+    env = Envelope(provider=provider.name, run_id=job.run_id, cwd=str(job.cwd))
+    env.model, env.scope, env.dry_run = job.model, list(job.scope), job.dry_run
+    env.report_path = str(job.report) if job.report else None
+    env.read_only = job.read_only
+    env.read_only_enforcement = provider.read_only_enforcement(job)
+    return env
+
+
+def measure_delta(cwd: Path, run_dir: Path, tree0: str, scope: list[str],
+                  report: Path | None, env: Envelope) -> None:
+    """Record the worker-delta against baseline `tree0`: diff, stat, scope.
+
+    One rule for every run, whether its wrapper finished it or a later
+    `settle_dead` found it dead. Diff paths are relative to the repository
+    root and `--scope` to `--cwd`, so the scope is rebased onto the root; the
+    report the caller asked for is never a violation.
+    """
+    index0, index1 = run_dir / "index0", run_dir / "index1"
+    diff_text = diff_from_tree(cwd, tree0, index1) + submodule_diff(cwd, index0, index1)
+    env.diff_stat, env.empty_diff = _stat_from_diff(diff_text)
+    if diff_text:
+        diff_path = run_dir / "diff.patch"
+        diff_path.write_bytes(diff_text.encode("utf-8", errors="surrogateescape"))
+        env.diff_path = str(diff_path)
+    if scope:
+        top = git_toplevel(cwd)
+        allow = [os.path.relpath(cwd.resolve() / s, top) for s in scope]
+        if report is not None:
+            allow.append(os.path.relpath(report.resolve(), top))
+        env.scope_violations = violations(diff_paths(diff_text), allow)
+
+
+def _spawn(argv: list[str], cwd: Path, log_path: Path, extra_env: dict[str, str],
+           stdin: Path | None) -> subprocess.Popen:
+    with log_path.open("w", encoding="utf-8", errors="replace") as log, \
+         (stdin.open("rb") if stdin else open(os.devnull, "rb")) as feed:
         return subprocess.Popen(
-            argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1,
+            argv, cwd=str(cwd), stdin=feed,
+            # A runner may print bytes that are not UTF-8; one must not end the run.
+            stdout=subprocess.PIPE, stderr=log, encoding="utf-8", errors="replace", bufsize=1,
             env={**os.environ, **extra_env}, start_new_session=True,
         )
 
@@ -254,8 +290,7 @@ def _stream(proc: subprocess.Popen, provider: Provider, stream_path: Path,
                 except OSError:
                     pass
             if provider.parses_stream:
-                ev = provider.parse(line)
-                if ev is not None:
+                for ev in provider.parse(line):
                     acc.add(ev)
                     if not quiet:
                         msg = ev.compact()
@@ -276,45 +311,49 @@ def _stream(proc: subprocess.Popen, provider: Provider, stream_path: Path,
             _write_progress(run_dir, acc, liveness)
 
 
-def _group_alive(proc: subprocess.Popen) -> bool:
-    """True while any process remains in the worker's group."""
-    try:
-        os.killpg(proc.pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True  # exists, not ours to signal
-    return True
+class _WorkerGroup:
+    """The worker's process group, which the leader's pid names.
 
-
-def _kill_group(proc: subprocess.Popen, *, grace: float = 1.0) -> None:
-    """Tear down the worker's whole process group, not just its leader.
-
-    The leader may exit — cleanly and successfully — while a backgrounded
-    descendant keeps running and keeps writing into the work tree. Those
-    writes would land after the final snapshot, outside the reported delta,
-    so the group is always emptied before the delta is taken. An already-empty
-    group raises ProcessLookupError on the first signal, which costs nothing on
-    the common clean exit.
+    Once the group is seen empty with its leader reaped, the id is free for
+    the kernel to give another process, so the group is never signalled again.
     """
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        proc.poll()
-        return
-    deadline = time.monotonic() + grace
-    try:
-        proc.wait(timeout=grace)  # reap the leader so it stops holding the group
-    except subprocess.TimeoutExpired:
-        pass
-    while time.monotonic() < deadline and _group_alive(proc):
-        time.sleep(0.02)
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    if proc.returncode is None:
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.gone = False
+
+    def kill(self, *, grace: float = 1.0) -> None:
+        """Tear down the whole group, not just its leader.
+
+        The leader may exit — cleanly and successfully — while a backgrounded
+        descendant keeps running and keeps writing into the work tree. Those
+        writes would land after the final snapshot, outside the reported delta,
+        so the group is always emptied before the delta is taken. An already-empty
+        group raises ProcessLookupError on the first signal, which costs nothing on
+        the common clean exit.
+        """
+        if self.gone:
+            return
+        proc = self.proc
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            proc.wait()  # no group, so the leader has exited; reap it
+            self.gone = True
+            return
+        deadline = time.monotonic() + grace
+        try:
+            proc.wait(timeout=grace)  # reap the leader so it stops holding the group
+        except subprocess.TimeoutExpired:
+            pass
+        while time.monotonic() < deadline and group_alive(proc.pid):
+            time.sleep(0.02)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         proc.wait()
+        self.gone = not group_alive(proc.pid)
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -371,14 +410,16 @@ def _stat_from_diff(diff_text: str) -> tuple[str, bool]:
         return "", True
     files = set()
     add = rem = 0
+    in_hunk = False  # `---`/`+++` headers precede a file's first hunk
     for ln in diff_text.splitlines():
-        if ln.startswith("+++ ") or ln.startswith("--- "):
-            continue
         if ln.startswith("diff --git"):
             files.add(ln)
-        elif ln.startswith("+"):
+            in_hunk = False
+        elif ln.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and ln.startswith("+"):
             add += 1
-        elif ln.startswith("-"):
+        elif in_hunk and ln.startswith("-"):
             rem += 1
     n = len(files)
     return f"{n} file(s) changed, +{add}/-{rem}", n == 0
@@ -410,6 +451,66 @@ def _write_stub_report(report: Path, env: Envelope, acc: _Accum) -> None:
         pass
 
 
+def _classify_stop(env: Envelope, acc: _Accum, provider: Provider, log_path: Path,
+                   rc: int | None, cancelled: bool, timed_out: bool,
+                   timeout_reason: tuple[str, float] | None) -> None:
+    """How the worker ended, unless an earlier step already failed the run."""
+    if env.error is not None:
+        return
+    if cancelled:
+        env.stop_reason, env.exit_code = STOP_CANCELLED, 1
+    elif acc.stop_reason in ("cancelled", "canceled", "aborted"):
+        # Nobody asked delegate to cancel: the runner ended its own run
+        # (grok reports `--max-turns` exhaustion as "cancelled"). That is
+        # a worker failure with a reason, not an operator cancel.
+        why = acc.error or _runner_error(log_path) or "no reason on stderr"
+        env.fail(f"{provider.runner} ended the run itself ({acc.stop_reason}): {why}", 1,
+                 acc.error_kind or "other")
+    elif timed_out:
+        why, duration = timeout_reason or ("idle", 0.0)
+        tools, writes = acc.counts["tool_call"], acc.counts["write"]
+        if why == "hard_cap":
+            error = (f"hard cap {_fmt_duration(duration)} reached "
+                     f"({tools} tool calls, {writes} writes)")
+        else:
+            error = (f"idle {_fmt_duration(duration)}: no runner output since "
+                     f"{acc.last_kind or 'start'} "
+                     f"({tools} tool calls, {writes} writes)")
+        env.fail(error, 1, "timeout", stop=STOP_TIMEOUT)
+    elif rc != 0:
+        why = acc.error or _runner_error(log_path)
+        env.fail(f"{provider.runner} exited {rc}" + (f": {why}" if why else ""), 1,
+                 acc.error_kind or "other")
+    elif acc.error:
+        # The runner exited 0 but its stream ended on an error.
+        env.fail(f"{provider.runner} exited 0 but reported an error: {acc.error}", 1,
+                 acc.error_kind or "other")
+    else:
+        env.stop_reason, env.exit_code = STOP_END, 0
+
+
+def _apply_contracts(job: Job, env: Envelope, meta0: dict | None) -> None:
+    """The containment checks; each outranks the worker's own outcome."""
+    # --read-only is a contract, not a hint: any delta fails the run, whatever
+    # the worker's exit. Ignored files stay outside snapshots.
+    if job.read_only and not env.empty_diff:
+        env.fail(f"work tree changed while the read-only run was active "
+                 f"({env.diff_stat}); the worker or another process wrote it; "
+                 f"see {env.diff_path}", 2)
+    # What git runs and sees is config, not content: a change is reported, never
+    # repaired, and (like HEAD below) outranks the worker's own exit.
+    touched = gitguard.changed(meta0, gitguard.fingerprint(job.cwd) or {}) if meta0 else []
+    if touched:
+        shown = ", ".join(touched[:5]) + (f" (+{len(touched) - 5} more)" if len(touched) > 5 else "")
+        env.fail(f"worker changed git metadata ({shown}); the wrapper never repairs "
+                 f"it. Inspect: git -C {job.cwd} config --show-origin --list", 2)
+    # SAFE-1 has precedence over worker exit, cancellation, and timeout.
+    head_after = git_head(job.cwd)
+    if env.base_commit is not None and head_after != env.base_commit:
+        env.fail(f"worker moved HEAD during the run ({env.base_commit} -> {head_after}); "
+                 "the wrapper never commits or resets history; inspect the repository", 2)
+
+
 def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
         hard_cap: float | None = None, heartbeat: Path | None = None,
         quiet: bool = False) -> Envelope:
@@ -419,10 +520,7 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
     if hard_cap is None:
         hard_cap = _env_seconds("DELEGATE_HARD_CAP", HARD_CAP)
     started = time.monotonic()
-    env = Envelope(provider=provider.name, run_id=job.run_id, cwd=str(job.cwd))
-    env.model, env.scope, env.dry_run = job.model, list(job.scope), job.dry_run
-    env.read_only = job.read_only
-    env.report_path = str(job.report) if job.report else None
+    env = envelope_for(job, provider)
     job.run_dir.mkdir(parents=True, exist_ok=True)
     log_path, stream_path = job.run_dir / "runner.log", job.run_dir / "stream.jsonl"
     env.log_path, env.stream_path = str(log_path), str(stream_path)
@@ -448,7 +546,7 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
             if (job.run_dir / "cancel").exists():
                 cancelled.set()
             if cancelled.is_set():
-                _kill_group(proc)
+                group.kill()
                 return
             # stderr is the other sign of life: runner.log grows.
             try:
@@ -461,12 +559,12 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
             now = time.monotonic()
             if now - started > hard_cap:
                 timed_out, timeout_reason = True, ("hard_cap", now - started)
-                _kill_group(proc)
+                group.kill()
                 return
             silent = liveness.idle_for(now)
             if silent > idle_timeout:
                 timed_out, timeout_reason = True, ("idle", silent)
-                _kill_group(proc)
+                group.kill()
                 return
 
     try:
@@ -482,7 +580,9 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
         if not cancelled.is_set():
             argv = provider.command(job)
             _record_command(job, argv)
-            proc = _spawn(argv, job.cwd, log_path, provider.environment(job))
+            feed = job.run_dir / "prompt.txt" if provider.prompt_via == "stdin" else None
+            proc = _spawn(argv, job.cwd, log_path, provider.environment(job), feed)
+            group = _WorkerGroup(proc)
             rec = read_job(job.run_id)
             if rec is not None:
                 rec.worker_pid = proc.pid
@@ -493,8 +593,7 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
                     job.run_dir, liveness)
             rc = proc.wait()
     except Exception as e:
-        env.error = f"run failed: {e}"
-        env.stop_reason, env.exit_code = STOP_ERROR, 2
+        env.fail(f"run failed: {e}", 2)
     finally:
         finished.set()
         if monitor is not None:
@@ -503,7 +602,7 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
             # Unconditional: a leader that exited 0 can still have left
             # background children alive in the group (SAFE: no worker write
             # may outlive the snapshot below).
-            _kill_group(proc)
+            group.kill()
             if proc.stdout is not None:
                 proc.stdout.close()
         liveness.finish()
@@ -511,112 +610,49 @@ def run(job: Job, provider: Provider, *, idle_timeout: float | None = None,
         try:
             # Shared authoritative post-run, including cancelled/failed workers.
             if tree0 is not None:
-                diff_text = diff_from_tree(job.cwd, tree0, job.run_dir / "index1")
-                env.diff_stat, env.empty_diff = _stat_from_diff(diff_text)
-                if diff_text:
-                    diff_path = job.run_dir / "diff.patch"
-                    diff_path.write_bytes(
-                        diff_text.encode("utf-8", errors="surrogateescape"))
-                    env.diff_path = str(diff_path)
-                unrestricted = any(s.strip().rstrip("/") in ("", ".") for s in job.scope)
-                if job.scope and not unrestricted:
-                    env.scope_violations = violations(diff_paths(diff_text),
-                                                       allow=job.scope, deny=[])
+                measure_delta(job.cwd, job.run_dir, tree0, job.scope, job.report, env)
         except Exception as e:
             # Nothing here may escape the teardown: provider cleanup, the
             # envelope, and signal restoration all still have to happen.
-            env.error = f"post-run diff failed: {e}"
-            env.stop_reason, env.exit_code = STOP_ERROR, 2
+            env.fail(f"post-run diff failed: {e}", 2)
 
         env.turns, env.cost_usd = acc.turns, acc.cost_usd
         env.failed_tool_calls = acc.failed_tool_calls
         if acc.usage["requests"]:
             env.provider_extra["usage"] = dict(acc.usage)
-        if env.error is None:
-            if cancelled.is_set():
-                env.stop_reason, env.exit_code = STOP_CANCELLED, 1
-            elif acc.stop_reason in ("cancelled", "canceled", "aborted"):
-                # Nobody asked delegate to cancel: the runner ended its own run
-                # (grok reports `--max-turns` exhaustion as "cancelled"). That is
-                # a worker failure with a reason, not an operator cancel.
-                why = acc.error or _runner_error(log_path) or "no reason on stderr"
-                env.stop_reason, env.exit_code = STOP_ERROR, 1
-                env.error = f"{provider.runner} ended the run itself ({acc.stop_reason}): {why}"
-            elif timed_out:
-                env.stop_reason, env.exit_code = STOP_TIMEOUT, 1
-                why, duration = timeout_reason or ("idle", 0.0)
-                tools, writes = acc.counts["tool_call"], acc.counts["write"]
-                if why == "hard_cap":
-                    env.error = (f"hard cap {_fmt_duration(duration)} reached "
-                                 f"({tools} tool calls, {writes} writes)")
-                else:
-                    env.error = (f"idle {_fmt_duration(duration)}: no runner output since "
-                                 f"{acc.last_kind or 'start'} "
-                                 f"({tools} tool calls, {writes} writes)")
-            elif rc != 0:
-                env.stop_reason, env.exit_code = STOP_ERROR, 1
-                why = acc.error or _runner_error(log_path)
-                env.error = f"{provider.runner} exited {rc}" + (f": {why}" if why else "")
-            elif acc.error:
-                # The runner exited 0 but its stream ended on an error.
-                env.stop_reason, env.exit_code = STOP_ERROR, 1
-                env.error = (f"{provider.runner} exited 0 but reported an error: "
-                             f"{acc.error}")
-            else:
-                env.stop_reason, env.exit_code = STOP_END, 0
+        _classify_stop(env, acc, provider, log_path, rc, cancelled.is_set(),
+                       timed_out, timeout_reason)
         try:
             if rc is not None:
                 provider.finish(job, env, rc)
         except Exception as e:
             if env.stop_reason == STOP_END:
-                env.error = f"provider result failed: {e}"
-                env.stop_reason, env.exit_code = STOP_ERROR, 2
+                env.fail(f"provider result failed: {e}", 2)
         finally:
             try:
                 provider.cleanup()
             except Exception as e:
-                env.error = f"provider cleanup failed: {e}"
-                env.stop_reason, env.exit_code = STOP_ERROR, 2
-        try:
-            answer = _record_answer(job, provider, env, acc)
-        except OSError as e:
-            answer = None
-            if env.error is None:
-                env.error = f"answer capture failed: {e}"
-                env.stop_reason, env.exit_code = STOP_ERROR, 2
+                env.fail(f"provider cleanup failed: {e}", 2)
         # A wrong answer shape is a worker failure, like a non-zero runner exit.
         # A right one is saved as the bare object: answerPath then needs no parsing.
-        if job.schema is not None and env.stop_reason == STOP_END:
-            obj, problem = check_answer(answer, job.schema)
-            if problem:
-                env.error = f"answer does not satisfy --schema: {problem}"
-                env.stop_reason, env.exit_code = STOP_ERROR, 1
-            else:
-                path = job.run_dir / "answer.json"
-                path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n",
-                                encoding="utf-8")
-                env.answer_path = str(path)
-        # --read-only is a contract, not a hint: any delta fails the run, whatever
-        # the worker's exit. Ignored files stay outside snapshots.
-        if job.read_only and not env.empty_diff:
-            env.error = (f"work tree changed while the read-only run was active "
-                         f"({env.diff_stat}); the worker or another process wrote it; "
-                         f"see {env.diff_path}")
-            env.stop_reason, env.exit_code = STOP_ERROR, 2
-        # What git runs and sees is config, not content: a change is reported, never
-        # repaired, and (like HEAD below) outranks the worker's own exit.
-        touched = gitguard.changed(meta0, gitguard.fingerprint(job.cwd) or {}) if meta0 else []
-        if touched:
-            shown = ", ".join(touched[:5]) + (f" (+{len(touched) - 5} more)" if len(touched) > 5 else "")
-            env.error = (f"worker changed git metadata ({shown}); the wrapper never repairs "
-                         f"it. Inspect: git -C {job.cwd} config --show-origin --list")
-            env.stop_reason, env.exit_code = STOP_ERROR, 2
-        # SAFE-1 has precedence over worker exit, cancellation, and timeout.
-        head_after = git_head(job.cwd)
-        if env.base_commit is not None and head_after != env.base_commit:
-            env.error = (f"worker moved HEAD during the run ({env.base_commit} -> {head_after}); "
-                         "the wrapper never commits or resets history; inspect the repository")
-            env.stop_reason, env.exit_code = STOP_ERROR, 2
+        # A failed write stops here, so the read-only and HEAD checks still run.
+        try:
+            answer = _record_answer(job, provider, env, acc)
+            if job.schema is not None and env.stop_reason == STOP_END:
+                obj, problem = check_answer(answer, job.schema)
+                if problem:
+                    env.fail(f"answer does not satisfy --schema: {problem}", 1)
+                else:
+                    path = job.run_dir / "answer.json"
+                    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n",
+                                    encoding="utf-8")
+                    env.answer_path = str(path)
+        except OSError as e:
+            if env.error is None:
+                env.fail(f"answer capture failed: {e}", 2)
+        _apply_contracts(job, env, meta0)
+        if env.error_kind == "usage_limit" and acc.resets_at is not None:
+            env.resets_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(acc.resets_at))
         if job.report is not None:
             if not job.report.exists() and env.stop_reason in (STOP_CANCELLED, STOP_TIMEOUT):
                 _write_stub_report(job.report, env, acc)

@@ -10,8 +10,6 @@ sets `is_error`.
 
 from __future__ import annotations
 
-import json
-
 from .base import Event, Job, Provider
 
 
@@ -21,6 +19,7 @@ class Cursor(Provider):
     parses_stream = True
     read_only = "app"
     answers = True
+    supports = frozenset({"no_sandbox"})
 
     def argv(self, job: Job) -> list[str]:
         args = ["--print", "--workspace", str(job.cwd), "--trust", "--force",
@@ -37,17 +36,10 @@ class Cursor(Provider):
         args += ["--", job.prompt]
         return args
 
-    def parse(self, line: str) -> Event | None:
-        line = line.strip()
-        if not line or line[0] != "{":
-            return None
-        try:
-            d = json.loads(line)
-        except ValueError:
-            return None
+    def events(self, d: dict) -> list[Event]:
         if d.get("type") == "result" and isinstance(d.get("result"), str):
             stop = d.get("subtype") or "end_turn"
             if d.get("is_error"):
-                return Event(kind="error", stop_reason=stop, text=d["result"])
-            return Event(kind="end", stop_reason=stop, text=d["result"])
-        return None
+                return [Event(kind="error", stop_reason=stop, text=d["result"])]
+            return [Event(kind="end", stop_reason=stop, text=d["result"])]
+        return []

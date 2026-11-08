@@ -15,20 +15,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from delegate.envelope import (  # noqa: E402
     SCHEMA_VERSION,
-    STOP_CANCELLED,
     STOP_END,
-    STOP_ERROR,
-    STOP_TIMEOUT,
     Envelope,
 )
 
 # The complete, exact top-level key set of a schema-3 envelope.
 EXPECTED_KEYS = {
     "schemaVersion", "provider", "runId", "cwd",
-    "stopReason", "exitCode", "error",
+    "stopReason", "exitCode", "error", "errorKind", "resetsAt",
     "turns", "costUsd", "failedToolCalls", "model",
     "baseCommit", "dirtyBefore", "diffPath", "diffStat", "emptyDiff",
-    "scope", "scopeViolations", "readOnly", "answerPath",
+    "scope", "scopeViolations", "readOnly", "readOnlyEnforcement", "answerPath",
     "reportPath", "reportExists",
     "logPath", "streamPath",
     "durationSeconds", "dryRun", "providerExtra",
@@ -104,12 +101,6 @@ class TestEnvelopeShape(unittest.TestCase):
         self.assertIsNone(obj["reportPath"])
         # reportExists defaults to None (not yet checked), not False.
         self.assertIsNone(obj["reportExists"])
-
-    def test_stop_reason_constants(self) -> None:
-        self.assertEqual(STOP_END, "end_turn")
-        self.assertEqual(STOP_CANCELLED, "cancelled")
-        self.assertEqual(STOP_TIMEOUT, "timeout")
-        self.assertEqual(STOP_ERROR, "error")
 
 
 if __name__ == "__main__":

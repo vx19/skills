@@ -3,15 +3,20 @@
 The boilerplate is deliberately tiny — four standing constraints. Three of
 them stop the headless cancels (skills auto-firing, implicit questions, plan
 mode). The fourth tells the worker to write to disk early, in small pieces.
-Other guidance (reading budget, do-not-touch list, whole-file pytest, "write
-the REPORT before the final verification step") is *content*, so it lives in
-`templates/rules.md` and `templates/task.md`, which the user copies and edits.
-Rules stay text, not code.
+Other guidance (reading budget, do-not-touch list, whole-file pytest) is
+*content*, so it lives in the `templates/` files the user copies and edits.
+Rules stay text, not code. HTML comments in a rules or task file are notes for
+the orchestrator and are stripped.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+# Linux caps one argv string at 128 KiB (MAX_ARG_STRLEN). A runner that takes
+# the prompt as one is refused a bigger one before any work, not with E2BIG.
+MAX_PROMPT_BYTES = 120 * 1024
 
 # Standing constraints baked into the prompt. Keep this short. A read-only
 # run uses the variant below, which drops the write-early sentence.
@@ -46,6 +51,15 @@ class PromptError(RuntimeError):
     pass
 
 
+# Notes for the orchestrator in a rules or task file (template guidance, a
+# filled example) are HTML comments; the worker never sees them.
+_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _read_file(p: Path) -> str:
+    return _COMMENT.sub("", p.read_text(encoding="utf-8", errors="replace")).strip()
+
+
 def read_task(task: str | None, task_is_file: bool) -> str:
     """`task` is either an inline string or a path (task_is_file)."""
     if task is None:
@@ -57,7 +71,7 @@ def read_task(task: str | None, task_is_file: bool) -> str:
     p = Path(task)
     if not p.is_file():
         raise PromptError(f"--task file not found: {task}")
-    text = p.read_text(encoding="utf-8", errors="replace").strip()
+    text = _read_file(p)
     if not text:
         raise PromptError(f"--task file is empty: {task}")
     return text
@@ -69,7 +83,7 @@ def read_rules(rules: list[str]) -> list[str]:
         p = Path(r)
         if not p.is_file():
             raise PromptError(f"--rules file not found: {r}")
-        text = p.read_text(encoding="utf-8", errors="replace").strip()
+        text = _read_file(p)
         if text:
             out.append(text)
     return out
@@ -86,3 +100,11 @@ def assemble(task: str, rules: list[str], *, read_only: bool = False,
     if computer_use:
         parts.append(COMPUTER_USE_CLAUSE)
     return "\n\n".join(p for p in parts if p.strip())
+
+
+def check_argument_size(prompt: str, provider: str) -> None:
+    size = len(prompt.encode("utf-8", errors="surrogateescape"))
+    if size > MAX_PROMPT_BYTES:
+        raise PromptError(f"the prompt is {size // 1024} KiB; {provider} takes it as one "
+                          f"argument, capped at {MAX_PROMPT_BYTES // 1024} KiB. "
+                          "Shorten --task or --rules, or use claude, codex or grok")

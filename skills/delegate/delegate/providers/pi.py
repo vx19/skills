@@ -3,7 +3,8 @@
 The `--mode json` stream is parsed for turns, cost, tool calls, and the final
 answer. Pi has no built-in sandbox — it runs with the caller's full privileges — and
 never prompts for trust non-interactively; the CLI prints one stderr warning
-about the missing sandbox. Provider/model come from --provider-arg.
+about the missing sandbox. The model comes from --model and the provider
+from --provider-arg provider=NAME.
 """
 
 from __future__ import annotations
@@ -21,12 +22,13 @@ class Pi(Provider):
     runner = "pi"
     parses_stream = True
     answers = True
+    supports = frozenset({"effort"})
     # Signals the CLI to print the unsandboxed warning line once.
     unsandboxed = True
     extra_keys = frozenset({"provider"})
 
     def argv(self, job: Job) -> list[str]:
-        args = ["-p", job.prompt, "--no-session", "--no-extensions", "--mode", "json"]
+        args = ["-p", "--no-session", "--no-extensions", "--mode", "json"]
         provider = job.extra.get("provider")
         if provider:
             args += ["--provider", provider]
@@ -34,7 +36,7 @@ class Pi(Provider):
             args += ["--model", job.model]
         if job.effort:
             args += ["--thinking", job.effort]
-        return args
+        return args + ["--", job.prompt]
 
     def preflight_check(self, job: Job) -> str | None:
         raw = os.environ.get("PI_CODING_AGENT_DIR")
@@ -62,17 +64,9 @@ class Pi(Provider):
             return denied(exc)
         return None
 
-    def parse(self, line: str) -> Event | None:
-        line = line.strip()
-        if not line or line[0] != "{":
-            return None
-        try:
-            data = json.loads(line)
-        except ValueError:
-            return None
-        if not isinstance(data, dict):
-            return None
-        return _parse_line(data)
+    def events(self, data: dict) -> list[Event]:
+        ev = _parse_line(data)
+        return [ev] if ev else []
 
 
 _WRITE_NAMES = frozenset({"write", "edit"})

@@ -15,24 +15,46 @@ class TestClaudeParser(unittest.TestCase):
     def test_tool_use(self):
         line = json.dumps({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Write", "input": {"file_path": "/x/p.txt"}}]}})
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "tool_call")
         self.assertEqual(ev.name, "Write")
         self.assertEqual(ev.path, "/x/p.txt")
 
+    def test_a_message_yields_an_event_per_block(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Editing."},
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "/x/a.py"}}]}})
+        self.assertEqual([(ev.kind, ev.name) for ev in self.p.parse(line)],
+                         [("text", None), ("tool_call", "Edit")])
+
+    def test_user_message_text_is_not_worker_text(self):
+        line = json.dumps({"type": "user", "message": {"content": [
+            {"type": "text", "text": "injected context"},
+            {"type": "tool_result", "is_error": False}]}})
+        self.assertEqual([ev.kind for ev in self.p.parse(line)], ["tool_result"])
+
+    def test_only_file_editing_tools_are_writes(self):
+        def write(name):
+            return self.p.parse(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": name, "input": {}}]}}))[0].write
+        for name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            self.assertTrue(write(name), name)
+        for name in ("Read", "Bash", "Grep"):
+            self.assertFalse(write(name), name)
+
     def test_result(self):
         line = json.dumps({"type": "result", "subtype": "success",
                            "num_turns": 2, "total_cost_usd": 0.11})
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "end")
         self.assertEqual(ev.turns, 2)
         self.assertAlmostEqual(ev.cost_usd, 0.11)
 
     def test_later_end_event_replaces_turns_and_cost(self):
         acc = _Accum()
-        acc.add(self.p.parse(json.dumps(
+        acc.add(*self.p.parse(json.dumps(
             {"type": "result", "num_turns": 2, "total_cost_usd": 0.11})))
-        acc.add(self.p.parse(json.dumps(
+        acc.add(*self.p.parse(json.dumps(
             {"type": "result", "num_turns": 5, "total_cost_usd": 0.4})))
         self.assertEqual(acc.turns, 5)
         self.assertAlmostEqual(acc.cost_usd, 0.4)
@@ -40,12 +62,21 @@ class TestClaudeParser(unittest.TestCase):
     def test_tool_result_error(self):
         line = json.dumps({"type": "user", "message": {"content": [
             {"type": "tool_result", "is_error": True}]}})
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "tool_result")
         self.assertIs(ev.ok, False)
 
+    def test_an_http_status_sets_the_error_kind(self):
+        def kind(status):
+            [ev] = self.p.parse(json.dumps({"type": "result", "subtype": "success",
+                                            "is_error": True, "api_error_status": status,
+                                            "result": "refused"}))
+            return ev.error_kind
+        self.assertEqual([kind(s) for s in (429, 401, 403, 500, None)],
+                         ["usage_limit", "auth", "auth", None, None])
+
     def test_non_json_ignored(self):
-        self.assertIsNone(self.p.parse("not json"))
+        self.assertEqual(self.p.parse("not json"), [])
 
     def test_result_error_carries_message_and_http_status(self):
         line = json.dumps({
@@ -54,14 +85,14 @@ class TestClaudeParser(unittest.TestCase):
             "api_error_status": 429,
             "result": "You've hit your session limit",
         })
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "error")
         self.assertEqual(ev.text, "You've hit your session limit (HTTP 429)")
         self.assertEqual(ev.turns, 2)
         self.assertAlmostEqual(ev.cost_usd, 0.01)
 
     def test_result_error_without_status_keeps_the_message(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "result", "is_error": True, "result": "boom"}))
         self.assertEqual((ev.kind, ev.text), ("error", "boom"))
 
@@ -70,7 +101,7 @@ class TestCodexParser(unittest.TestCase):
     p = Codex()
 
     def test_command_started_is_a_shell_tool_call(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "item.started",
             "item": {"id": "i-1", "type": "command_execution",
                      "command": "echo hi", "exit_code": None},
@@ -80,7 +111,7 @@ class TestCodexParser(unittest.TestCase):
         self.assertIsNone(ev.path)
 
     def test_file_change_completed_is_a_write(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "item.completed",
             "item": {"id": "i-2", "type": "file_change",
                      "changes": [{"path": "a.txt", "kind": "update"}]},
@@ -91,7 +122,7 @@ class TestCodexParser(unittest.TestCase):
         self.assertIs(ev.write, True)
 
     def test_failed_command_completed_is_a_failed_tool_result(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "item.completed",
             "item": {"type": "command_execution", "exit_code": 1},
         }))
@@ -100,20 +131,20 @@ class TestCodexParser(unittest.TestCase):
         self.assertIs(ev.ok, False)
 
     def test_successful_command_completed_is_silent(self):
-        self.assertIsNone(self.p.parse(json.dumps({
+        self.assertEqual(self.p.parse(json.dumps({
             "type": "item.completed",
             "item": {"type": "command_execution", "exit_code": 0},
-        })))
+        })), [])
 
     def test_agent_message_is_text(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "item.completed",
             "item": {"type": "agent_message", "text": "done"},
         }))
         self.assertEqual((ev.kind, ev.text), ("text", "done"))
 
     def test_turn_completed_counts_a_turn_and_usage(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "turn.completed",
             "usage": {"input_tokens": 10, "cached_input_tokens": 3,
                       "output_tokens": 5, "reasoning_output_tokens": 2},
@@ -129,19 +160,28 @@ class TestCodexParser(unittest.TestCase):
         self.assertEqual(acc.usage["input"], 10)
 
     def test_error_is_the_providers_message(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "error", "message": "You've hit your usage limit."}))
         self.assertEqual(ev.kind, "error")
         self.assertEqual(ev.text, "You've hit your usage limit.")
 
     def test_turn_failed_carries_the_nested_message_and_counts_the_turn(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "turn.failed",
             "error": {"message": "model is not supported"},
         }))
         self.assertEqual(ev.kind, "error")
         self.assertEqual(ev.text, "model is not supported")
         self.assertEqual(ev.turns_delta, 1)
+
+    def test_an_api_refusal_status_sets_the_error_kind(self):
+        def kind(status):
+            inner = json.dumps({"type": "error", "status": status,
+                                "error": {"type": "x", "message": "refused"}})
+            [ev] = self.p.parse(json.dumps({"type": "error", "message": inner}))
+            return ev.error_kind
+        self.assertEqual([kind(s) for s in (429, 401, 403, 400)],
+                         ["usage_limit", "auth", "auth", None])
 
     def test_unknown_and_non_json_lines_are_ignored(self):
         for line in (
@@ -151,12 +191,12 @@ class TestCodexParser(unittest.TestCase):
             json.dumps({"type": "item.completed", "item": "nope"}),
             json.dumps({"type": "turn.failed", "error": "nope"}),
         ):
-            self.assertIsNone(self.p.parse(line), line)
+            self.assertEqual(self.p.parse(line), [], line)
 
     def test_accum_keeps_the_last_stream_error(self):
         acc = _Accum()
-        acc.add(self.p.parse(json.dumps({"type": "error", "message": "first"})))
-        acc.add(self.p.parse(json.dumps({
+        acc.add(*self.p.parse(json.dumps({"type": "error", "message": "first"})))
+        acc.add(*self.p.parse(json.dumps({
             "type": "turn.failed", "error": {"message": "last"}})))
         self.assertEqual(acc.error, "last")
         self.assertEqual(acc.turns, 1)
@@ -168,20 +208,20 @@ class TestGrokParser(unittest.TestCase):
     def test_tool_call(self):
         line = json.dumps({"type": "tool_call", "name": "search_replace",
                            "input": {"path": "a.py"}})
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "tool_call")
         self.assertEqual(ev.name, "search_replace")
         self.assertEqual(ev.path, "a.py")
         self.assertIs(ev.write, True)
 
     def test_thought_is_an_event_without_text(self):
-        ev = self.p.parse(json.dumps({"type": "thought", "data": "reasoning chunk"}))
+        [ev] = self.p.parse(json.dumps({"type": "thought", "data": "reasoning chunk"}))
         self.assertEqual(ev.kind, "thought")
         self.assertIsNone(ev.text)
         self.assertEqual(ev.compact(), "")
 
     def test_usage_maps_token_fields(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "usage",
             "usage": {"input_tokens": 11, "output_tokens": 4,
                       "reasoning_tokens": 2, "cache_read_input_tokens": 0,
@@ -201,7 +241,7 @@ class TestGrokParser(unittest.TestCase):
         self.assertEqual(acc.usage["input"], 22)
 
     def test_list_dir_uses_target_directory(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "tool_call", "toolName": "list_dir", "kind": "list",
             "rawInput": {"target_directory": "src"},
         }))
@@ -211,7 +251,7 @@ class TestGrokParser(unittest.TestCase):
         self.assertIs(ev.write, False)
 
     def test_read_file_raw_input_is_not_a_write(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "tool_call", "toolName": "read_file", "kind": "read",
             "rawInput": {"target_file": "src/a.py"},
         }))
@@ -221,7 +261,7 @@ class TestGrokParser(unittest.TestCase):
         self.assertIs(ev.write, False)
 
     def test_write_tool_call_marks_write_and_file_path(self):
-        ev = self.p.parse(json.dumps({
+        [ev] = self.p.parse(json.dumps({
             "type": "tool_call", "toolName": "write", "kind": "edit",
             "rawInput": {"file_path": "src/b.py", "content": "x"},
         }))
@@ -230,11 +270,11 @@ class TestGrokParser(unittest.TestCase):
         self.assertEqual(ev.path, "src/b.py")
 
     def test_edit_kind_and_delete_name_are_writes(self):
-        edit = self.p.parse(json.dumps({
+        [edit] = self.p.parse(json.dumps({
             "type": "tool_call", "toolName": "apply_patch", "kind": "edit",
             "rawInput": {"path": "src/c.py"},
         }))
-        delete = self.p.parse(json.dumps({
+        [delete] = self.p.parse(json.dumps({
             "type": "tool_call", "toolName": "delete_file",
             "rawInput": {"path": "src/old.py"},
         }))
@@ -246,14 +286,14 @@ class TestGrokParser(unittest.TestCase):
     def test_end(self):
         line = json.dumps({"type": "result", "stopReason": "end_turn",
                            "num_turns": 3, "total_cost_usd": 0.2})
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "end")
         self.assertEqual(ev.stop_reason, "end_turn")
         self.assertEqual(ev.turns, 3)
 
     def test_failed_update(self):
         line = json.dumps({"type": "tool_call_update", "status": "failed", "name": "x"})
-        ev = self.p.parse(line)
+        [ev] = self.p.parse(line)
         self.assertEqual(ev.kind, "tool_result")
         self.assertIs(ev.ok, False)
 
@@ -355,8 +395,7 @@ class TestPiParser(unittest.TestCase):
         ]
         acc = _Accum()
         for line in lines:
-            ev = pi.parse(line)
-            if ev is not None:
+            for ev in pi.parse(line):
                 acc.add(ev)
         self.assertEqual(acc.turns, 2)
         self.assertAlmostEqual(acc.cost_usd, 0.75)
@@ -370,7 +409,7 @@ class TestPiParser(unittest.TestCase):
         self.assertEqual(acc.last_kind, "turn")
 
     def test_turn_end_is_a_turn_and_a_bare_end_is_silent(self):
-        ev = Pi().parse(_pi_turn_end())
+        [ev] = Pi().parse(_pi_turn_end())
         self.assertEqual(ev.kind, "turn")
         self.assertEqual(ev.turns_delta, 1)
         self.assertIsNone(ev.cost_usd)
@@ -388,19 +427,19 @@ class TestPiParser(unittest.TestCase):
 
     def test_tool_paths_and_write_flag(self):
         pi = Pi()
-        edit = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
+        [edit] = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
             "type": "toolcall_end",
             "toolCall": {"name": "edit", "arguments": {"file_path": "src/b.py"}},
         }}))
-        read = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
+        [read] = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
             "type": "toolcall_end",
             "toolCall": {"name": "read", "arguments": {"path": "src/a.py"}},
         }}))
-        bash = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
+        [bash] = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
             "type": "toolcall_end",
             "toolCall": {"name": "bash", "arguments": {"command": "ls"}},
         }}))
-        encoded = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
+        [encoded] = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
             "type": "toolcall_end",
             "toolCall": {"name": "edit", "arguments": "{\"file_path\": \"src/c.py\"}"},
         }}))
@@ -430,8 +469,8 @@ class TestPiParser(unittest.TestCase):
             json.dumps({"type": "tool_execution_start", "toolName": "bash"}),
             json.dumps({"type": "auto_retry_end", "success": True}),
         ):
-            self.assertIsNone(pi.parse(line), line)
-        ev = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
+            self.assertEqual(pi.parse(line), [], line)
+        [ev] = pi.parse(json.dumps({"type": "message_update", "assistantMessageEvent": {
             "type": "toolcall_end",
             "toolCall": {"name": "write", "arguments": [1]},
         }}))

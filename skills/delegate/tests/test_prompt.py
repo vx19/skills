@@ -35,6 +35,21 @@ class TestPrompt(unittest.TestCase):
             p = Path(d) / "t.md"; p.write_text("FROMFILE")
             self.assertEqual(read_task(str(p), task_is_file=True), "FROMFILE")
 
+    def test_html_comments_in_files_never_reach_the_worker(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.md"
+            p.write_text("<!-- note to self -->\nDo it.\n<!--\nexample\n-->\n")
+            self.assertEqual(read_task(str(p), task_is_file=True), "Do it.")
+            self.assertEqual(read_rules([str(p)]), ["Do it."])
+
+    def test_shipped_templates_send_no_meta_text(self):
+        templates = Path(__file__).resolve().parents[1] / "templates"
+        for name in ("rules.md", "task.md", "observe.task.md"):
+            with self.subTest(name=name):
+                sent = read_task(str(templates / name), task_is_file=True)
+                for meta in ("<!--", "pass via", "copy", "Copy"):
+                    self.assertNotIn(meta, sent)
+
     def test_missing_rules_file_raises(self):
         with self.assertRaises(PromptError):
             read_rules(["/no/such/rules.md"])

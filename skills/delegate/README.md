@@ -6,7 +6,7 @@ responsible for reviewing and committing them.
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.11 or newer
 - Git
 - A POSIX host for live runs
 - The provider CLI you intend to use, installed and authenticated separately

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -62,6 +63,12 @@ class ReplayPinTests(unittest.TestCase):
         self.assertEqual((env["stopReason"], env["exitCode"]), ("error", 1))
         self.assertEqual(env["error"], "codex exited 1: quota exceeded for this account")
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX modes")
+    def test_a_first_run_creates_a_private_state_dir(self) -> None:
+        artifacts: dict = {}
+        replaymod.replay(FIXTURES / "grok-success", artifacts=artifacts)
+        self.assertEqual(oct(artifacts["stateRootMode"]), oct(0o700))
+
     def test_codex_usage_limit(self) -> None:
         env = self.envelope("codex-usage-limit")
         self.assertEqual(env["provider"], "codex")
@@ -97,12 +104,107 @@ class ReplayPinTests(unittest.TestCase):
         self.assertIn("session limit", env["error"])
         self.assertIn("HTTP 429", env["error"])
 
+    def success(self, name: str | Path) -> tuple[dict, str | None]:
+        artifacts: dict = {}
+        env = replaymod.replay(FIXTURES / name, artifacts=artifacts)
+        self.assertEqual((env["stopReason"], env["exitCode"], env["error"]),
+                         ("end_turn", 0, None), name)
+        return env, artifacts.get("answer")
+
     def test_grok_success(self) -> None:
-        env = self.envelope("grok-success")
-        self.assertEqual(env["provider"], "grok")
-        self.assertEqual(env["stopReason"], "end_turn")
-        self.assertEqual(env["exitCode"], 0)
-        self.assertIsNone(env["error"])
+        env, answer = self.success("grok-success")
+        self.assertEqual((env["turns"], env["costUsd"], answer), (35, 0.01, "done"))
+        self.assertEqual(env["providerExtra"]["usage"],
+                         {"input": 10, "output": 5, "reasoning": 0, "cache_read": 0,
+                          "requests": 1})
+
+    def test_claude_success(self) -> None:
+        env, answer = self.success("claude-success")
+        self.assertEqual((env["turns"], env["costUsd"], answer), (2, 0.02, "Done."))
+
+    def test_codex_success_reads_the_answer_codex_wrote(self) -> None:
+        env, answer = self.success("codex-success")
+        self.assertEqual((env["turns"], answer), (1, "All done.\n"))
+        self.assertEqual(env["providerExtra"]["usage"]["cache_read"], 2)
+
+    def test_cursor_success(self) -> None:
+        env, answer = self.success("cursor-success")
+        self.assertEqual((env["turns"], env["costUsd"], answer), (None, None, "done"))
+
+    def test_pi_success(self) -> None:
+        env, answer = self.success("pi-success")
+        self.assertEqual((env["turns"], env["costUsd"], answer), (1, 0.003, "Finished."))
+
+    def test_a_truncated_last_line_is_ignored(self) -> None:
+        env, answer = self.success("grok-truncated")
+        self.assertEqual(answer, "partial answer")
+
+    def test_non_utf8_bytes_on_stdout_do_not_end_the_run(self) -> None:
+        # Built here: a tracked fixture stays UTF-8 text (see the next test).
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp)
+            (fixture / "meta.json").write_text('{"provider": "grok", "exit": 0}')
+            (fixture / "runner.log").write_text("")
+            (fixture / "stream.jsonl").write_bytes(
+                b'{"type":"text","data":"caf\xe9 "}\n{"type":"text","data":"done"}\n'
+                b'{"type":"end","stopReason":"end_turn","num_turns":1}\n')
+            env, answer = self.success(fixture)
+        self.assertEqual(answer, "caf\ufffd done")
+
+    def test_every_fixture_file_is_utf8_text(self) -> None:
+        # The public mirror publishes text only; one stray byte stops its export.
+        for path in sorted(p for p in FIXTURES.rglob("*") if p.is_file()):
+            with self.subTest(path=path.relative_to(FIXTURES)):
+                path.read_bytes().decode("utf-8")
+
+    def test_an_api_key_in_the_environment_reaches_no_run_file(self) -> None:
+        secret = "sk-replay-secret-0123456789"
+        for name in ("grok-success", "codex-success", "claude-429"):
+            with self.subTest(name=name):
+                artifacts: dict = {}
+                env = replaymod.replay(FIXTURES / name, artifacts=artifacts, env_extra={
+                    "XAI_API_KEY": secret, "OPENAI_API_KEY": secret,
+                    "ANTHROPIC_API_KEY": secret})
+                self.assertNotIn(secret, json.dumps(env))
+                self.assertIn("command.json", artifacts["files"])
+                for file, text in artifacts["files"].items():
+                    self.assertNotIn(secret, text, file)
+
+    def test_claude_reads_every_block_of_a_message(self) -> None:
+        env = self.envelope("claude-parallel-tools")
+        self.assertEqual((env["stopReason"], env["exitCode"]), ("end_turn", 0))
+        self.assertEqual(env["failedToolCalls"], 1)
+
+    def test_error_kind_comes_from_structured_fields_only(self) -> None:
+        # Error prose is not matched ("429 rate limit" stays "other"), except
+        # codex's usage-limit message, its only signal for that failure.
+        expected = {
+            "claude-429": "usage_limit",          # api_error_status 429
+            "claude-429-exit0": "usage_limit",
+            "claude-max-turns": "max_turns",      # subtype error_max_turns
+            "codex-model-refused": "other",       # inner status 400
+            "codex-usage-limit": "usage_limit",   # codex's turn.failed message
+            "codex-reconnect-then-exit1": "other",
+            "cursor-auth": "other",
+            "cursor-is-error": "other",
+            "grok-error": "other",
+            "pi-error": "other",
+            "grok-success": None,
+            "claude-parallel-tools": None,
+            "codex-reconnect-then-success": None,
+            "claude-success": None,
+            "codex-success": None,
+            "cursor-success": None,
+            "pi-success": None,
+            "grok-truncated": None,
+        }
+        self.assertEqual(sorted(expected), sorted(m.parent.name for m in FIXTURES.glob("*/meta.json")))
+        got = {name: self.envelope(name)["errorKind"] for name in expected}
+        self.assertEqual(got, expected)
+
+    def test_a_rejected_usage_window_gives_its_reset_time(self) -> None:
+        self.assertEqual(self.envelope("claude-429")["resetsAt"], "2026-01-01T00:00:00Z")
+        self.assertIsNone(self.envelope("codex-usage-limit")["resetsAt"])
 
     def test_cursor_auth(self) -> None:
         env = self.envelope("cursor-auth")

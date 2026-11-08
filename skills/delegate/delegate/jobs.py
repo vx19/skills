@@ -1,7 +1,7 @@
 """Background job records and their lifecycle.
 
 State lives under `state_root()/<run_id>/`:
-  job.json     — record (provider, cwd, scope, pid, pgid, status, times)
+  job.json     — record (provider, cwd, scope, report, pid, pgid, status, times)
   result.json  — the envelope, written once the run ends (terminal signal)
   live.lock    — flock held for the run; the kernel drops it when the wrapper dies
   heartbeat    — mtime bumped every streamed line; per-run progress display
@@ -18,13 +18,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import signal
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .lib.paths import state_root
+from .lib.policy import path_matches
 
 _PRUNE_INTERVAL = 24 * 60 * 60
 _PRUNE_STAMP = ".pruned"
@@ -37,6 +41,7 @@ class JobRecord:
     provider: str
     cwd: str
     scope: list[str] = field(default_factory=list)
+    report: str | None = None
     status: str = "running"          # running | done | cancelled | error
     pid: int | None = None
     pgid: int | None = None
@@ -46,7 +51,7 @@ class JobRecord:
     background: bool = False
 
     def path(self) -> Path:
-        return state_root() / self.run_id / "job.json"
+        return run_dir_for(self.run_id) / "job.json"
 
     def save(self) -> None:
         p = self.path()
@@ -56,12 +61,46 @@ class JobRecord:
         tmp.replace(p)
 
 
+def make_state_root_private(*, create: bool = False) -> None:
+    """Tighten the state root to mode 0700; with `create`, make it so first.
+
+    Run dirs hold prompts, transcripts and provider args. A private root keeps
+    every other user out without touching modes inside it, or the umask the
+    worker inherits for the files it writes in the user's repository. Only a
+    real run creates the root: a read or a dry run leaves no state behind.
+    """
+    if os.name == "nt":
+        return
+    root = state_root()
+    try:
+        if create:
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        elif not root.is_dir():
+            return
+        if root.stat().st_mode & 0o077:
+            root.chmod(0o700)
+    except OSError as e:
+        print(f"delegate: warning: could not make {root} private: {e}", file=sys.stderr)
+
+
+class InvalidJobId(ValueError):
+    """A job id that is not one plain name under the state root."""
+
+
+# One path component: no separator, never "." or "..", nothing leading with a dot.
+_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
 def run_dir_for(run_id: str) -> Path:
+    """The run's directory. Every path built from a job id goes through here."""
+    if not isinstance(run_id, str) or not _JOB_ID.fullmatch(run_id):
+        raise InvalidJobId(f"invalid job id {run_id!r}; job ids look like "
+                           "20260101T120000Z-ab12cd34")
     return state_root() / run_id
 
 
 def read_job(run_id: str) -> JobRecord | None:
-    p = state_root() / run_id / "job.json"
+    p = run_dir_for(run_id) / "job.json"
     if not p.is_file():
         return None
     try:
@@ -72,7 +111,7 @@ def read_job(run_id: str) -> JobRecord | None:
 
 
 def read_result(run_id: str) -> dict[str, Any] | None:
-    p = state_root() / run_id / "result.json"
+    p = run_dir_for(run_id) / "result.json"
     if not p.is_file():
         return None
     try:
@@ -99,7 +138,7 @@ def list_jobs() -> list[JobRecord]:
         return []
     out = []
     for d in sorted(root.iterdir(), reverse=True):
-        if d.is_dir():
+        if d.is_dir() and _JOB_ID.fullmatch(d.name):
             r = read_job(d.name)
             if r is not None:
                 out.append(r)
@@ -120,24 +159,95 @@ def live_jobs() -> list[JobRecord]:
 
 
 def pid_alive(pid: int | None) -> bool:
+    """True while `pid` runs. A zombie has exited, though kill(pid, 0) still
+    answers until its parent reaps it, which a container without init never does."""
     if not pid:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         return True  # exists, not ours to signal — sandbox may deny info
     except OSError:
         return False
+    return not _is_zombie(pid)
+
+
+def _proc_state(pid: int) -> str | None:
+    """Linux process state letter from /proc, or None where /proc is absent."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return stat.rsplit(")", 1)[1].split()[0]  # the field after "(comm)"
+
+
+def _is_zombie(pid: int) -> bool:
+    state = _proc_state(pid)
+    if state is not None:
+        return state == "Z"
+    # Without /proc (macOS): a zombie still answers kill(0) but has no group.
+    try:
+        os.getpgid(pid)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def group_alive(pgid: int) -> bool:
+    """True while any running process remains in group `pgid`.
+
+    The group is probed directly, so a leader that exited does not hide a
+    member that still writes. Members that are only zombies do not count.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists, not ours to signal — never call it gone
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return True  # no /proc to tell zombies apart
+    for pid in pids:
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if int(fields[2]) == pgid and fields[0] != "Z":  # state, ppid, pgrp
+            return True
+    return False
 
 
 LIVE_LOCK_NAME = "live.lock"
 
 
 class RunIdCollision(RuntimeError):
-    """A run id that is already active — never share a run dir."""
+    """A run id that already has a run dir — never share one."""
+
+
+def finalize(rec: JobRecord, env) -> None:
+    """Persist a finished run: result.json atomically, then the record's final status."""
+    run_dir = run_dir_for(rec.run_id)
+    tmp = run_dir / "result.tmp"
+    tmp.write_text(json.dumps(env.to_json(), indent=2), encoding="utf-8")
+    tmp.replace(run_dir / "result.json")
+    rec = read_job(rec.run_id) or rec
+    rec.status = {0: "done"}.get(env.exit_code, env.stop_reason or "error")
+    rec.finished_at = time.time()
+    rec.save()
+
+
+def claim_run_dir(run_id: str) -> None:
+    """Create the run's directory; an id that already has one, finished or live, is refused."""
+    try:
+        run_dir_for(run_id).mkdir()
+    except FileExistsError:
+        raise RunIdCollision(f"run {run_id} already exists; a run never reuses a run dir") from None
 
 
 def _fcntl():
@@ -207,7 +317,7 @@ def is_wrapper_alive(rec: JobRecord) -> bool:
 
 def heartbeat_age(run_id: str, now: float | None = None) -> float | None:
     """Seconds since the heartbeat file was touched. `now` defaults to time.time()."""
-    hb = state_root() / run_id / "heartbeat"
+    hb = run_dir_for(run_id) / "heartbeat"
     try:
         if not hb.is_file():
             return None
@@ -282,15 +392,19 @@ def format_live_status(rec: JobRecord, progress: dict | None, now: float) -> str
     return " \u00b7 ".join(parts)
 
 
-def scope_overlap(scope: list[str]) -> list[str]:
-    """Return run_ids of live jobs whose scope intersects `scope` (advisory)."""
+def scope_overlap(cwd: Path, scope: list[str]) -> list[str]:
+    """Return run_ids of live jobs whose scope intersects `scope` (advisory).
+
+    Each scope is taken relative to its own job's cwd, and an unscoped live job
+    covers all of its cwd. Two scopes overlap when either one contains the other.
+    """
     if not scope:
         return []
-    want = {s.rstrip("/") for s in scope}
+    want = [str(cwd / s) for s in scope]
     hits = []
     for j in live_jobs():
-        other = {s.rstrip("/") for s in j.scope}
-        if want & other or (not other):  # empty scope = whole tree = always overlaps
+        other = [str(Path(j.cwd) / s) for s in (j.scope or ["."])]
+        if any(path_matches(a, b) or path_matches(b, a) for a in want for b in other):
             hits.append(j.run_id)
     return hits
 
@@ -302,11 +416,38 @@ def cancel(run_id: str) -> tuple[bool, str]:
     if read_result(run_id) is not None:
         return False, f"job {run_id} already finished"
     if not is_wrapper_alive(rec):
-        return False, f"job {run_id} wrapper is gone; inspect the recorded worker before repair"
+        return _stop_orphan(rec)
     # A durable request also covers the background fork/startup race. Core's
     # monitor kills its own child group and then writes a cancelled envelope.
     (run_dir_for(run_id) / "cancel").touch()
     return True, f"cancellation requested for job {run_id}"
+
+
+def _stop_orphan(rec: JobRecord, grace: float = 2.0) -> tuple[bool, str]:
+    """Stop the worker group a dead wrapper left behind, then settle the run.
+
+    Core starts the worker as the leader of a new group, so the group whose id
+    is the recorded worker pid is the worker's, even after the leader exits;
+    the system never hands a live group's id to a new process. A process that
+    merely reuses the pid in another group is never signalled. A group that is
+    not our child has no exit event to wait on, hence the bounded poll
+    between SIGTERM and SIGKILL.
+    """
+    pid = rec.worker_pid
+    if pid and not _worker_group_gone(rec):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                break
+            deadline = time.monotonic() + grace
+            while not _worker_group_gone(rec) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if _worker_group_gone(rec):
+                break
+    if settle_dead(rec) is None and read_result(rec.run_id) is None:
+        return False, f"job {rec.run_id}: worker group {pid} did not exit"
+    return True, f"job {rec.run_id}: wrapper was gone; stopped its worker and settled the run"
 
 
 def _worker_group_gone(rec: JobRecord) -> bool:
@@ -318,19 +459,13 @@ def _worker_group_gone(rec: JobRecord) -> bool:
     pid = rec.worker_pid or rec.pgid
     if not pid:
         return True
-    try:
-        group = os.getpgid(pid)
-        os.killpg(group, 0)
-    except ProcessLookupError:
-        return not pid_alive(pid)
-    except OSError:
-        return False  # exists, not ours to signal — never settle it dead
-    return False
+    return not group_alive(pid)  # core starts the worker as its own group leader
 
 
 def _stream_error(run_id: str, provider_name: str) -> str | None:
-    """Last parsed runner error in the stream, at most 300 characters."""
+    """The stream's open runner error, as core.run judges it, at most 300 characters."""
     try:
+        from .core import _Accum
         from .providers import get
 
         prov = get(provider_name)
@@ -339,13 +474,12 @@ def _stream_error(run_id: str, provider_name: str) -> str | None:
         stream = run_dir_for(run_id) / "stream.jsonl"
         if not stream.is_file():
             return None
-        reason = None
+        acc = _Accum()
         with stream.open(encoding="utf-8", errors="replace") as lines:
             for line in lines:
-                ev = prov.parse(line)
-                if ev is not None and ev.kind == "error" and ev.text:
-                    reason = ev.text[:_REASON_LIMIT]
-        return reason
+                for ev in prov.parse(line):
+                    acc.add(ev)
+        return acc.error[:_REASON_LIMIT] if acc.error else None
     except Exception:
         return None
 
@@ -363,14 +497,28 @@ def settle_dead(rec: JobRecord) -> dict[str, Any] | None:
     if not _worker_group_gone(rec):
         return None
 
-    from .envelope import Envelope, STOP_ERROR
+    from .envelope import Envelope
 
     error = "wrapper died before writing a result"
     why = _stream_error(rec.run_id, rec.provider)
     if why:
         error += f": {why}"
     env = Envelope(provider=rec.provider, run_id=rec.run_id, cwd=rec.cwd)
-    env.stop_reason, env.exit_code, env.error = STOP_ERROR, 1, error
+    env.fail(error, 1)
+    # The worker pid is recorded only after the baseline snapshot finished, so
+    # with it the saved index0 is a complete baseline to measure against.
+    baseline = run_dir_for(rec.run_id) / "index0"
+    if rec.worker_pid and baseline.is_file():
+        from .core import measure_delta
+        from .lib.snapshot import index_tree
+
+        cwd = Path(rec.cwd)
+        try:
+            report = Path(rec.report) if rec.report else None
+            measure_delta(cwd, run_dir_for(rec.run_id), index_tree(cwd, baseline),
+                          rec.scope, report, env)
+        except Exception as e:
+            env.fail(f"{error}; post-run diff failed: {e}", 2)
     payload = env.to_json()
 
     dest = run_dir_for(rec.run_id) / "result.json"

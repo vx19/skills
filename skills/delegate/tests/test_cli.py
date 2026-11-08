@@ -1,10 +1,9 @@
 """CLI surface tests for the new unified `delegate` command.
 
 Driven in-process via `delegate.cli.main([...])`, capturing the stdout envelope.
-Everything here is offline: `run --dry-run` skips preflight and never launches a
-runner, so we can assert each provider's launch *posture* (the argv the provider
-would exec) without any runner on PATH. Usage errors, `--` handling, and doctor's
-exit contract are checked too.
+Everything here is offline: `run --dry-run` never launches a runner. Usage
+errors, the dry-run envelope, run ids, `wait` and doctor's exit contract are
+checked here; each provider's launch argv is in test_argv.
 """
 
 from __future__ import annotations
@@ -23,26 +22,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from delegate import cli  # noqa: E402
+from tests.helpers import run_cli  # noqa: E402
 
 USAGE_EXIT = 64
-
-# provider -> (expected argv[0] runner, [substrings that MUST appear in argv])
-POSTURE = {
-    "grok":   ("grok",        ["--permission-mode", "auto", "--no-plan", "--single"]),
-    "claude": ("claude",      ["-p", "--permission-mode", "auto", "--add-dir"]),
-    "codex":  ("codex",       ["exec", "--approve-for-me", "--json"]),
-    "cursor": ("cursor-agent", ["--print", "--force", "--trust"]),
-    "pi":     ("pi",          ["-p", "--no-session", "--mode", "json"]),
-}
-
-
-def _contains_flag_value(argv, flag, value):
-    """True if `flag` is immediately followed by `value` somewhere in argv."""
-    for i, tok in enumerate(argv):
-        if tok == flag and i + 1 < len(argv) and argv[i + 1] == value:
-            return True
-    return False
-
 
 class CliTestBase(unittest.TestCase):
     def setUp(self) -> None:
@@ -65,11 +47,7 @@ class CliTestBase(unittest.TestCase):
         self._tmp.cleanup()
 
     def run_cli(self, argv):
-        """Return (exit_code, stdout, stderr)."""
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(argv)
-        return code, out.getvalue(), err.getvalue()
+        return run_cli(argv)
 
     def dry_run(self, provider, extra=None, prompt="do the thing"):
         argv = ["run", "--provider", provider, "--cwd", ".", "--dry-run"]
@@ -82,76 +60,54 @@ class CliTestBase(unittest.TestCase):
         return env
 
 
-class TestDryRunPosture(CliTestBase):
+class TestDryRun(CliTestBase):
     def test_envelope_is_a_dry_run(self) -> None:
         env = self.dry_run("grok")
         self.assertEqual(env["schemaVersion"], 3)
         self.assertTrue(env["dryRun"])
         self.assertEqual(env["provider"], "grok")
         self.assertEqual(env["stopReason"], "end_turn")
-        self.assertIn("argv", env["providerExtra"])
-
-    def test_all_providers_posture(self) -> None:
-        for provider, (runner, must_have) in POSTURE.items():
-            with self.subTest(provider=provider):
-                extra = ["--provider-arg", "provider=openai"] if provider == "pi" else None
-                env = self.dry_run(provider, extra=extra)
-                argv = env["providerExtra"]["argv"]
-                self.assertEqual(argv[0], runner,
-                                 f"{provider}: argv[0]={argv[0]!r} != {runner!r}")
-                for tok in must_have:
-                    self.assertIn(tok, argv, f"{provider}: missing {tok!r} in {argv}")
-
-    def test_grok_permission_mode_pairs_auto(self) -> None:
-        argv = self.dry_run("grok")["providerExtra"]["argv"]
-        self.assertTrue(_contains_flag_value(argv, "--permission-mode", "auto"))
-
-    def test_claude_add_dir_and_permission_mode(self) -> None:
-        argv = self.dry_run("claude")["providerExtra"]["argv"]
-        self.assertTrue(_contains_flag_value(argv, "--permission-mode", "auto"))
-        self.assertIn("--add-dir", argv)
-
-    def test_codex_exec_and_approval(self) -> None:
-        argv = self.dry_run("codex")["providerExtra"]["argv"]
-        self.assertEqual(argv[1], "exec")
-        # --approve-for-me auto-approves in codex's workspace-write sandbox and
-        # is mutually exclusive with --sandbox, so --sandbox must NOT appear.
-        self.assertIn("--approve-for-me", argv)
-        self.assertNotIn("--sandbox", argv)
-
-    def test_pi_mode_json(self) -> None:
-        argv = self.dry_run("pi", extra=["--provider-arg", "provider=openai"])["providerExtra"]["argv"]
-        self.assertTrue(_contains_flag_value(argv, "--mode", "json"))
+        self.assertEqual(env["providerExtra"]["prompt"].split("\n\n")[0], "do the thing")
 
     def test_pi_schema_is_accepted(self) -> None:
         schema = Path(self._tmp.name) / "s.json"
         schema.write_text("{}", encoding="utf-8")
-        argv = self.dry_run("pi", extra=["--schema", str(schema)])["providerExtra"]["argv"]
-        self.assertIn("Answer format", argv[argv.index("-p") + 1])
+        prompt = self.dry_run("pi", extra=["--schema", str(schema)])["providerExtra"]["prompt"]
+        self.assertIn("Answer format", prompt)
 
-    def test_model_flows_into_envelope_and_argv(self) -> None:
+    def test_model_flows_into_the_envelope(self) -> None:
         env = self.dry_run("grok", extra=["--model", "grok-4"])
         self.assertEqual(env["model"], "grok-4")
-        self.assertTrue(_contains_flag_value(env["providerExtra"]["argv"], "--model", "grok-4"))
-
-
-class TestPromptSurvival(CliTestBase):
-    def test_double_dash_separates_dashy_prompt(self) -> None:
-        # Everything after `--` is the positional prompt, even if it looks like a flag.
-        code, out, err = self.run_cli(
-            ["run", "--provider", "grok", "--cwd", ".", "--dry-run", "--", "--not-a-flag hello"]
-        )
-        self.assertEqual(code, 0, err)
-        argv = json.loads(out.strip())["providerExtra"]["argv"]
-        # grok passes the assembled prompt as the final --single argument.
-        self.assertIn("--not-a-flag hello", argv[-1])
-
-    def test_multiword_prompt_survives(self) -> None:
-        argv = self.dry_run("claude", prompt="fix the bug now")["providerExtra"]["argv"]
-        self.assertIn("fix the bug now", argv[-1])
 
 
 class TestUsageErrors(CliTestBase):
+    def test_a_prompt_too_big_for_one_argument_exits_64(self) -> None:
+        task = Path(self._tmp.name) / "big.txt"
+        task.write_text("x" * 140_000, encoding="utf-8")
+        for provider in ("cursor", "pi"):  # the runners that take it as an argument
+            code, out, err = self.run_cli(["run", "--provider", provider, "--cwd", ".",
+                                           "--dry-run", "--task", str(task)])
+            self.assertEqual(code, USAGE_EXIT, err)
+            self.assertEqual(out.strip(), "")
+            self.assertIn("KiB", err)
+
+    def test_a_big_prompt_is_fine_for_a_runner_that_reads_it_from_a_file(self) -> None:
+        task = Path(self._tmp.name) / "big.txt"
+        task.write_text("x" * 140_000, encoding="utf-8")
+        for provider in ("claude", "codex", "grok"):
+            code, out, err = self.run_cli(["run", "--provider", provider, "--cwd", ".",
+                                           "--dry-run", "--task", str(task)])
+            self.assertEqual(code, 0, f"{provider}: {err}")
+
+    def test_an_effort_that_is_not_a_plain_word_exits_64(self) -> None:
+        code, out, err = self.run_cli(["run", "--provider", "codex", "--cwd", ".", "--dry-run",
+                                       "--effort", 'high" sandbox_mode="danger', "--", "x"])
+        self.assertEqual(code, USAGE_EXIT, err)
+        self.assertIn("--effort", err)
+        code, out, err = self.run_cli(["run", "--provider", "codex", "--cwd", ".", "--dry-run",
+                                       "--effort", "xhigh", "--", "x"])
+        self.assertEqual(code, 0, err)
+
     def test_no_task_exits_64(self) -> None:
         code, out, err = self.run_cli(["run", "--provider", "grok", "--cwd", ".", "--dry-run"])
         self.assertEqual(code, USAGE_EXIT)
@@ -187,17 +143,35 @@ class TestUsageErrors(CliTestBase):
                 ["run", "--provider", "grok", "--cwd", ".", "--dry-run", "--task", taskfile]
             )
             self.assertEqual(code, 0, err)
-            argv = json.loads(out.strip())["providerExtra"]["argv"]
-            self.assertIn("TASK-FROM-FILE-MARKER", argv[-1])
+            prompt = json.loads(out.strip())["providerExtra"]["prompt"]
+            self.assertIn("TASK-FROM-FILE-MARKER", prompt)
         finally:
             os.unlink(taskfile)
 
 
 class TestContracts(CliTestBase):
+    def test_a_dry_run_envelope_carries_the_job_fields(self):
+        report = str(Path(self._tmp.name) / "report.md")
+        env = self.dry_run("grok", extra=["--report", report, "--scope", "src"])
+        self.assertEqual((env["scope"], env["reportPath"]),
+                         (["src"], str(Path(report).resolve())))
+
+    def test_unsupported_no_sandbox_warns(self):
+        for provider in ("claude", "pi"):
+            with self.subTest(provider=provider):
+                extra = ["--provider-arg", "provider=openai"] if provider == "pi" else []
+                code, _, err = self.run_cli(["run", "--provider", provider, "--dry-run",
+                                             "--no-sandbox", *extra, "task"])
+                self.assertEqual(code, 0)
+                self.assertIn("--no-sandbox is not supported", err)
+        _, _, err = self.run_cli(["run", "--provider", "codex", "--dry-run",
+                                  "--no-sandbox", "task"])
+        self.assertNotIn("--no-sandbox is not supported", err)
+
     def test_report_is_in_prompt(self):
         report = str(Path(self._tmp.name) / "report.md")
         env = self.dry_run("grok", extra=["--report", report])
-        self.assertIn(report, env["providerExtra"]["argv"][-1])
+        self.assertIn(report, env["providerExtra"]["prompt"])
 
     def test_unsupported_limits_warn(self):
         code, out, err = self.run_cli(["run", "--provider", "cursor", "--dry-run",
@@ -206,13 +180,22 @@ class TestContracts(CliTestBase):
         self.assertIn("--effort is not supported", err)
         self.assertIn("--max-turns is not supported", err)
 
-    def test_wait_honors_timeout_over_old_cap(self):
-        from unittest.mock import patch
+    def test_a_wall_clock_jump_does_not_end_a_wait(self):
+        from unittest.mock import MagicMock, patch
         from argparse import Namespace
-        # A result arriving at 600 seconds must still be read with timeout=700.
-        with patch("delegate.cli.time.time", side_effect=[0, 600]), \
-             patch("delegate.cli.jobsmod.read_result", return_value={"exitCode": 0}), \
-             redirect_stdout(io.StringIO()):
+        import itertools
+        # The clock steps an hour forward on every read (an NTP correction);
+        # the job is live and finishes on the second poll of a 700 s wait.
+        jumps = itertools.count(0, 3600)
+        with patch("delegate.cli.time.time", side_effect=lambda: next(jumps)), \
+             patch("delegate.cli.time.sleep"), \
+             patch("delegate.cli.jobsmod.read_job", return_value=MagicMock()), \
+             patch("delegate.cli.jobsmod.settle_dead"), \
+             patch("delegate.cli.jobsmod.is_wrapper_alive", return_value=True), \
+             patch("delegate.cli.jobsmod.read_progress", return_value=None), \
+             patch("delegate.cli.jobsmod.format_live_status", return_value="running"), \
+             patch("delegate.cli.jobsmod.read_result", side_effect=[None, {"exitCode": 0}]), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(cli.cmd_wait(Namespace(job="x", timeout=700)), 0)
 
 
@@ -230,8 +213,13 @@ class TestDoctor(CliTestBase):
             os.environ.update(env)
             return self.run_cli(argv)
 
-    def test_runner_absent_is_only_a_warn(self):
-        code, out, err = self.doctor(["doctor", "--provider", "grok"])
+    def test_a_named_provider_without_its_runner_fails(self):
+        code, out, err = self.doctor(["doctor", "--provider", "codex"])
+        self.assertEqual(code, 2, f"out={out} err={err}")
+        self.assertIn("FAIL codex : codex not on PATH", out)
+
+    def test_an_absent_runner_in_the_full_listing_is_only_a_warn(self):
+        code, out, err = self.doctor(["doctor"])
         self.assertEqual(code, 0, f"out={out} err={err}")
         self.assertIn("warn grok", out)
 
@@ -392,6 +380,95 @@ class TestLiveStatusAndWait(CliTestBase):
         self.assertEqual(code, 0, err)
         self.assertNotIn("usage:", listed)
         self.assertIn("end_turn", listed)
+
+
+class TestJobIds(CliTestBase):
+    """A job id names one run dir; it never reaches outside the state root."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = Path(self._tmp.name)
+        from delegate.lib.paths import state_root
+        state_root().mkdir()
+        outside = root / "outside"
+        outside.mkdir()
+        (outside / "stream.jsonl").write_text("secret transcript\n")
+        (outside / "job.json").write_text("{}\n")
+
+    def test_a_new_run_id_is_utc_with_eight_hex_digits(self):
+        from datetime import datetime, timezone
+        run_id = cli._new_run_id()
+        self.assertRegex(run_id, r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+        stamp = datetime.strptime(run_id[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        self.assertLess(abs((datetime.now(timezone.utc) - stamp).total_seconds()), 60)
+
+    def test_a_run_never_reuses_an_existing_run_dir(self):
+        from unittest.mock import patch
+        from delegate.lib.paths import state_root
+        old = state_root() / "20260101T000000Z-0000aaaa"
+        old.mkdir()
+        (old / "result.json").write_text('{"exitCode": 0}')
+        launch = AssertionError("a run with a taken id must not launch")
+        with patch("delegate.cli._new_run_id", return_value=old.name), \
+             patch("delegate.core.preflight"), \
+             patch("delegate.cli._run_foreground", side_effect=launch):
+            code, _, err = self.run_cli(["run", "--provider", "grok", "--cwd", ".", "task"])
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", err)
+        self.assertEqual((old / "result.json").read_text(), '{"exitCode": 0}')
+        self.assertEqual(sorted(p.name for p in old.iterdir()), ["result.json"])
+
+    def test_the_envelope_is_printed_even_when_result_json_cannot_be_written(self):
+        from unittest.mock import patch
+        from delegate.envelope import Envelope
+
+        def run(job, prov, **_):
+            (job.run_dir / "result.tmp").mkdir()  # the write fails, as on a full disk
+            return Envelope(provider="grok", run_id=job.run_id, cwd=str(job.cwd),
+                            stop_reason="end_turn")
+
+        out = io.StringIO()
+        with patch("delegate.core.preflight"), patch("delegate.core.run", side_effect=run), \
+             redirect_stdout(out), redirect_stderr(io.StringIO()):
+            with self.assertRaises(OSError):
+                cli.main(["run", "--provider", "grok", "--cwd", ".", "task"])
+        self.assertEqual(json.loads(out.getvalue())["stopReason"], "end_turn")
+
+    def test_every_job_command_refuses_a_path_as_job_id(self):
+        for argv in (["logs", "../outside"], ["logs", "--raw", "../outside"],
+                     ["status", "../outside"], ["result", "../outside"],
+                     ["wait", "../outside"], ["cancel", "../outside"],
+                     ["logs", "/etc"], ["logs", ".."], ["logs", "a/b"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(argv)
+                self.assertEqual(code, 64, f"out={out} err={err}")
+                self.assertNotIn("secret transcript", out)
+                self.assertIn("invalid job id", err)
+
+    def test_an_unknown_well_formed_id_is_still_exit_1(self):
+        code, _, err = self.run_cli(["logs", "20260101T000000-abcd"])
+        self.assertEqual(code, 1, err)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX modes")
+class TestPrivateState(CliTestBase):
+    """Run dirs hold prompts, transcripts and provider args: no other user may read them."""
+
+    def mode(self):
+        from delegate.lib.paths import state_root
+        return state_root().stat().st_mode & 0o777
+
+    def test_an_existing_shared_state_dir_becomes_private(self):
+        from delegate.lib.paths import state_root
+        state_root().mkdir(mode=0o755)
+        state_root().chmod(0o755)
+        self.run_cli(["status"])
+        self.assertEqual(oct(self.mode()), oct(0o700))
+
+    def test_a_read_only_command_creates_no_state_dir(self):
+        from delegate.lib.paths import state_root
+        self.run_cli(["status"])
+        self.assertFalse(state_root().exists())
 
 
 class TestLogs(CliTestBase):

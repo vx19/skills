@@ -1,7 +1,10 @@
-# Task — <one phase> (copy, fill in, pass via --task)
-
-One phase = one dispatch. Fill every section. If you cannot, the slice is too
-big or too vague — shrink it until you can.
+# Task — <one phase>
+<!--
+One phase = one dispatch: copy this file, fill in every section, pass it with
+--task. If you cannot fill a section, the slice is too big or too vague;
+shrink it until you can. Comments like this one never reach the worker. For a
+--read-only question, use observe.task.md instead.
+-->
 
 ## Objective
 <1-2 lines: the one concrete outcome of this phase.>
@@ -29,9 +32,10 @@ functions shortens the worker's time to first edit.>
 <For any data migration: the dry-run command and the path to the data COPY to
 run it against. Paste the output into the report before the real run.>
 
-## REPORT
-<Absolute path to write the report to. Write it BEFORE the final verification
-run. Also pass this path as --report on the command line.>
+<!--
+REPORT: pass the report path with --report, not here. Delegate tells the
+worker where to write it and to write it before the final verification run.
+-->
 
 <!--
 FILLED EXAMPLE
@@ -60,7 +64,5 @@ scripts/export.py --dry-run exits 0 and prints at least one "would write: ..." l
 ## Dry-run
 N/A (no data migration this phase).
 
-## REPORT
-/path/to/repo/.reports/export-dry-run.md
-(write before running the full pytest suite)
+(run with --report /path/to/repo/.reports/export-dry-run.md)
 -->

@@ -3,17 +3,17 @@
 A provider supplies runner-specific configuration and result interpretation:
   * how to build the runner's argv for a Job (the ONLY place a permission-mode
     or sandbox flag ever appears — never in the command the user types),
-  * how to turn one line of the runner's stream into a neutral Event,
-  * whether the target repo is trusted (when that is checkable offline).
+  * how to turn one parsed stream object into neutral Events.
 
 Optional hooks prepare configuration, check the environment before launch,
 ingest a final result, and release resources. Spawning, teeing,
 snapshotting, and the envelope live in
-`delegate.core` and is identical across providers.
+`delegate.core` and are identical across providers.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,11 +46,13 @@ class Event:
     """One neutral event parsed from a provider stream line.
 
     `kind` is one of: tool_call, tool_result, text, cost, end, thought, usage,
-    turn, error, other. `turn` counts a turn and prints nothing. `error` carries
-    the provider's own failure message in `text`.
-    A provider parser returns None for lines it does not care about.
+    turn, error, limit, other. `turn` counts a turn and prints nothing. `error`
+    carries the provider's own failure message in `text`. `limit` is a refused
+    usage window; `resets_at` is when it reopens.
+    A stream line yields a list of them; lines a provider does not care about yield none.
     `tokens` is a usage delta (input, output, reasoning, cache_read).
     `write` is true when a tool call writes a file.
+    `error_kind` classifies an error from a structured field (see status_kind).
     """
 
     kind: str
@@ -64,6 +66,8 @@ class Event:
     stop_reason: str | None = None   # provider's own terminal reason, if given
     tokens: dict[str, int] | None = None  # usage delta: input, output, reasoning, cache_read
     write: bool = False              # tool_call writes a file
+    error_kind: str | None = None    # error: usage_limit | auth | max_turns
+    resets_at: int | None = None     # limit: epoch seconds the usage window reopens
 
     def compact(self) -> str:
         """One human line for the streamed stderr view."""
@@ -84,6 +88,25 @@ class Event:
                 return ""
             return "  ● end " + " ".join(bits)
         return ""
+
+
+def status_kind(status) -> str | None:
+    """The error kind an HTTP status from the provider's API names, if any."""
+    return {429: "usage_limit", 401: "auth", 403: "auth"}.get(status)
+
+
+def as_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def as_float(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def usage_tokens(src: dict, fields) -> dict[str, int] | None:
@@ -120,6 +143,21 @@ class Provider:
     # The --provider-arg keys this provider reads; any other key is refused (64)
     # rather than silently ignored.
     extra_keys: frozenset[str] = frozenset()
+    # The run flags its argv honours: effort, max_turns, no_sandbox. Any other
+    # given flag warns that it is ignored.
+    supports: frozenset[str] = frozenset()
+    # How the runner gets the prompt: "argv" (one argument, which the OS caps
+    # and the process list shows), "stdin" (core feeds it prompt.txt), or
+    # "file" (argv names prompt.txt).
+    prompt_via: str = "argv"
+
+    def doctor(self, cwd: Path | None) -> list[tuple[str, str]]:
+        """Provider-only `doctor` lines as (level, text); level FAIL fails doctor."""
+        return []
+
+    def read_only_enforcement(self, job: Job) -> str | None:
+        """What stops writes in this run: the class posture, or None if not read-only."""
+        return self.read_only if job.read_only else None
 
     def argv(self, job: Job) -> list[str]:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -128,16 +166,20 @@ class Provider:
         """Complete launch command; providers may supply an explicit runner wrapper."""
         return [self.runner, *self.argv(job)]
 
-    def parse(self, line: str) -> Event | None:  # pragma: no cover - default
-        return None
+    def parse(self, line: str) -> list[Event]:
+        """The events in one stream line; a line that is not a JSON object has none."""
+        line = line.strip()
+        if not line.startswith("{"):
+            return []
+        try:
+            data = json.loads(line)
+        except ValueError:
+            return []
+        return self.events(data)
 
-    def trust(self, cwd: Path, job: Job | None = None) -> tuple[bool, str] | None:
-        """Return (trusted, fix_hint) or None when trust is not checkable
-        offline for this provider. core turns (False, hint) into exit 2.
-        ``job`` is set on a real run. Grok passes ``--trust`` and returns
-        None then, so a dispatch is not blocked on the saved grant. Doctor
-        calls this without a job and still reports the file."""
-        return None
+    def events(self, data: dict) -> list[Event]:
+        """The events in one parsed stream object."""
+        return []
 
     def preflight_check(self, job: Job) -> str | None:
         """Return an environment error, or None. core raises Preflight (exit 2)."""
