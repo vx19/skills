@@ -172,6 +172,13 @@ policy; applying it from another harness refuse-starts the worker).
 `~/.grok/auth.json` exists but cannot be read, unless `XAI_API_KEY` or
 `GROK_API_KEY` is set; a run exits 2 for the same reason.
 
+## Codex from a Grok shell
+
+Under a Grok Build sandbox on macOS (`GROK_AGENT=1`), codex cannot read the
+keychain's trust settings: the connection opens and the TLS handshake fails.
+Delegate then sets `SSL_CERT_FILE=/etc/ssl/cert.pem` for the codex child. A
+bundle you already set in `SSL_CERT_FILE` or `CODEX_CA_CERTIFICATE` wins.
+
 ## Pi
 
 Pi has no sandbox of its own. Before launch, Pi checks that its config dir can

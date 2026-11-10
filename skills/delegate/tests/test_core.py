@@ -222,6 +222,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(env.exit_code, 0, env.error)
         self.assertEqual(got.read_text(), self.job.prompt)
 
+    def test_the_provider_environment_reaches_the_runner(self):
+        got = self.root / "got"  # outside the tree: not part of the delta
+        provider = Fake(f"import os, pathlib; pathlib.Path({str(got)!r}).write_text(os.environ['DELEGATE_PROBE'])")
+        provider.environment = lambda job: {"DELEGATE_PROBE": "from the provider"}
+        env = core.run(self.job, provider)
+        self.assertEqual(env.exit_code, 0, env.error)
+        self.assertEqual(got.read_text(), "from the provider")
+
     def test_a_non_utf8_byte_on_stdout_does_not_end_the_run(self):
         env = core.run(self.job, Fake(
             "import sys; sys.stdout.buffer.write(b'caf\\xe9\\n'); sys.stdout.flush(); print('done')"))

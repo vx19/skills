@@ -19,9 +19,15 @@ import glob
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 from .base import Event, Job, Provider, status_kind, usage_tokens
+
+# Codex reads its TLS roots from macOS trust settings, and a Grok Build
+# seatbelt makes that load fail closed: the TCP connect succeeds, the
+# handshake does not. This PEM holds the same system roots.
+SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
 
 # What the Computer Use tool returns when the user has not approved an app.
 DENIED = re.compile(r"Computer Use was not approved to use ([^\n]+?)\s*$", re.MULTILINE)
@@ -90,6 +96,14 @@ class Codex(Provider):
 
     def computer_use_status(self) -> tuple[bool, str]:
         return computer_use_status()
+
+    def environment(self, job: Job) -> dict[str, str]:
+        # Only from a Grok tool shell, and never over a bundle the operator chose.
+        if (os.environ.get("GROK_AGENT") != "1" or sys.platform != "darwin"
+                or os.environ.get("SSL_CERT_FILE") or os.environ.get("CODEX_CA_CERTIFICATE")
+                or not os.access(SYSTEM_CA_FILE, os.R_OK)):
+            return {}
+        return {"SSL_CERT_FILE": SYSTEM_CA_FILE}
 
     def argv(self, job: Job) -> list[str]:
         # `--approve-for-me` auto-approves inside codex's workspace-write
